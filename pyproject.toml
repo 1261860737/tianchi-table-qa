@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "table-qa-agent"
+version = "0.2.0"
+description = "可解释的复杂表格问答分层专家基线"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "json-repair>=0.39,<1",
+  "loguru>=0.7,<1",
+  "openai>=1.68,<3",
+  "openpyxl>=3.1,<4",
+  "pandas>=2.2,<3",
+  "pillow>=11,<13",
+  "pydantic>=2.10,<3",
+  "pymupdf>=1.25,<2",
+  "python-dotenv>=1.0,<2",
+  "pyyaml>=6,<7",
+  "rich>=13.9,<15",
+  "tenacity>=9,<10",
+  "tqdm>=4.67,<5",
+  "typer>=0.15,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+table-qa = "table_qa_agent.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/table_qa_agent"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

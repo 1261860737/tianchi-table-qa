@@ -1,0 +1,24 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv/
+.conda/
+.pytest_cache/
+.ruff_cache/
+.tmp/
+.codex_tmp/
+.codex/
+__pycache__/
+*.py[cod]
+outputs/cache/
+outputs/logs/
+outputs/submissions/
+
+# 原始竞赛数据和本地提交文件不随源码发布。
+/files/
+/multimodal_table_recognition/
+/*.xlsx
+*.egg-info/
+build/
+dist/

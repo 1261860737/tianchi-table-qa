@@ -1,0 +1,51 @@
+provider:
+  api_key_env: DASHSCOPE_API_KEY
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  model: qwen3.7-plus
+  temperature: 0.0
+  max_tokens: 4096
+  timeout_seconds: 180
+  max_retries: 3
+  json_mode: true
+  enable_thinking: false
+  min_pixels: 262144
+  max_pixels: 8388608
+
+documents:
+  cache_dir: outputs/cache/documents
+  pdf_dpi: 220
+  max_pages: 12
+  max_long_edge: 4096
+  jpeg_quality: 92
+  max_encoded_bytes: 18874368
+
+runtime:
+  log_dir: outputs/logs
+  continue_on_error: true
+  max_workers: 8
+  request_interval_seconds: 0.0
+
+planning:
+  # 先通过强制 Function Call 生成结构化意图计划；失败时回退本地规则 Planner。
+  model_intent_enabled: true
+  fallback_to_rules: true
+
+retrieval:
+  enabled: true
+  roi_dpi: 360
+  padding_ratio: 0.03
+  max_regions: 3
+
+ocr:
+  enabled: true
+  # 留空时复用 provider.model；也可以单独配置 OCR/视觉模型名称。
+  model:
+  max_prompt_chars: 6000
+
+recovery:
+  enabled: true
+  max_operation_repairs: 1
+  max_visual_retries: 1
+  # Extract/Compute Agent 每题最多主动请求一次共享表格检查工具，避免循环调用。
+  max_agent_tool_calls: 1
+  repair_structure_dimensions: true
