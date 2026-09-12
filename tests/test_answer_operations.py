@@ -12,7 +12,7 @@ from table_qa_agent.executor import (
     validate_operation_grounding,
 )
 from table_qa_agent.prompts import (
-    ANSWER_OPERATION_CONTRACT,
+    COMPUTE_OPERATION_CONTRACT,
     FORCE_ANSWER_SYSTEM_APPENDIX,
     OPERATION_REPAIR_PROMPT,
     build_question_prompt,
@@ -68,7 +68,7 @@ def test_count_array_source_and_exclusions_are_explicit() -> None:
     assert execute_operation(operation, evidence) == 3  # 不擅自去重。
     assert execute_operation(OperationSpec(name="count", arguments={
         "values": [{"evidence_index": 0}],
-    }), evidence) == 1  # 旧的分组计数仍计一组，不自动拍平。
+    }), evidence) == 5  # 单一数组只剥一层，不递归拍平。
     assert execute_operation(OperationSpec(name="lookup", arguments={"value": 7})) == 7
 
 
@@ -106,17 +106,17 @@ def test_native_selection_works_in_pipeline() -> None:
     assert operation_selects_answer(operation)
 
 
-@pytest.mark.parametrize("specialist", ["extract", "visual_attribute", "compute", "structure"])
 @pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("specialist", ["extract", "visual_attribute", "compute", "structure"])
 def test_prompts_share_one_answer_boundary(specialist: str, force: bool) -> None:
     prompt = build_specialist_system_prompt(specialist, force_answer=force)
-    assert ANSWER_OPERATION_CONTRACT in prompt
     assert "必须绑定 Evidence" not in prompt
-    assert "多字段列表\n  必须使用 list" not in prompt
+    assert "multi_field 必须使用 Evidence + operation" in prompt
+    assert (COMPUTE_OPERATION_CONTRACT in prompt) == (specialist == "compute")
     question = QuestionRecord(id=1, file_name="a.png", question_type="extract",
                               question="依次读取两个字段", answer_format="json_array")
     user_prompt = build_question_prompt(question, force_answer=force)
     assert "必须绑定 Evidence" not in user_prompt
     if force:
         assert FORCE_ANSWER_SYSTEM_APPENDIX in user_prompt
-    assert ANSWER_OPERATION_CONTRACT in OPERATION_REPAIR_PROMPT
+    assert COMPUTE_OPERATION_CONTRACT in OPERATION_REPAIR_PROMPT

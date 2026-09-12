@@ -36,6 +36,7 @@ from table_qa_agent.documents import DocumentProcessingError, DocumentProcessor
 from table_qa_agent.executor import (
     ArgumentGroundingError,
     OperationExecutionError,
+    can_safely_replay_count,
     execute_operation,
     operation_selects_answer,
     validate_operation_grounding,
@@ -857,10 +858,15 @@ def _is_usable_success(result: RunResult, question: QuestionRecord) -> bool:
     )
 
 
-def replay_trace_result(result: RunResult, question: QuestionRecord) -> RunResult:
-    """用当前协议重放旧日志中的 Evidence，修复无需再次请求模型的格式失败。"""
+def replay_trace_result(
+    result: RunResult,
+    question: QuestionRecord,
+    *,
+    replay_success_operation: bool = False,
+) -> RunResult:
+    """用当前协议重放 Evidence；默认只恢复失败，可显式重算成功 Operation。"""
 
-    if _is_usable_success(result, question):
+    if _is_usable_success(result, question) and not replay_success_operation:
         return result
     evidence = result.evidence
     if evidence is None and result.raw_model_output:
@@ -878,8 +884,13 @@ def replay_trace_result(result: RunResult, question: QuestionRecord) -> RunResul
                 TableStructureAnswer.model_validate(tool_result)
             except Exception:
                 tool_result = repair_structure(tool_result)
-        # 日志中的 TaskPlan 可能来自旧协议；重放必须使用当前确定性 Planner。
-        plan = TaskPlanner().plan(question)
+        # 主动重算成功答案时沿用当时计划，避免把路由/投影变化混入确定性执行器实验。
+        # 失败日志可能缺计划，才使用当前规则 Planner 恢复。
+        plan = (
+            result.plan
+            if replay_success_operation and result.plan is not None
+            else TaskPlanner().plan(question)
+        )
         projection = _effective_projection(evidence.answer_projection, plan.answer_projection)
         if operation_selects_answer(evidence.operation):
             projection = None
@@ -906,7 +917,12 @@ def replay_trace_result(result: RunResult, question: QuestionRecord) -> RunResul
                 }
             )
         return result
-    warnings = [*result.warnings, "使用当前执行协议从历史 Evidence 重放恢复"]
+    replay_message = (
+        "使用当前执行协议重算历史成功 Operation"
+        if replay_success_operation and result.status == "success"
+        else "使用当前执行协议从历史 Evidence 重放恢复"
+    )
+    warnings = [*result.warnings, replay_message]
     return result.model_copy(
         update={
             "evidence": evidence,
@@ -923,6 +939,8 @@ def replay_trace_result(result: RunResult, question: QuestionRecord) -> RunResul
 def select_submission_results(
     questions: Iterable[QuestionRecord],
     result_sources: Iterable[Iterable[RunResult]],
+    *,
+    replay_success_counts: bool = False,
 ) -> list[RunResult]:
     """按来源优先级选择最近的合法成功结果，避免新一轮失败覆盖旧答案。"""
 
@@ -936,7 +954,20 @@ def select_submission_results(
             question = question_by_id.get(original.question_id)
             if question is None:
                 continue
-            candidate = replay_trace_result(original, question)
+            replay_count = bool(
+                replay_success_counts
+                and original.evidence is not None
+                and original.evidence.operation is not None
+                and can_safely_replay_count(
+                    original.evidence.operation,
+                    original.evidence.evidence,
+                )
+            )
+            candidate = replay_trace_result(
+                original,
+                question,
+                replay_success_operation=replay_count,
+            )
             if source_index == 0:
                 primary_latest[original.question_id] = candidate
             if _is_usable_success(candidate, question):

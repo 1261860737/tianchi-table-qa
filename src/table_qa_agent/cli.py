@@ -385,6 +385,13 @@ def build_submission(
             help="兼容旧命令，等价于 --answer-policy format-only",
         ),
     ] = False,
+    replay_success_counts: Annotated[
+        bool,
+        typer.Option(
+            "--replay-success-counts",
+            help="安全重算成功日志中的 count；不请求模型，并跳过缺失过滤语义的历史集合",
+        ),
+    ] = False,
 ) -> None:
     """从运行日志重放 Evidence、合并历史成功结果并生成提交文件。"""
 
@@ -393,7 +400,11 @@ def build_submission(
     active_policy = AnswerPolicy.FORMAT_ONLY if format_only else AnswerPolicy.STRICT_EVIDENCE
     sources = [JsonlRunStore(log_path).load_all()]
     sources.extend(JsonlRunStore(path).load_all() for path in fallback_logs or [])
-    results = select_submission_results(questions, sources)
+    results = select_submission_results(
+        questions,
+        sources,
+        replay_success_counts=replay_success_counts,
+    )
     results = _apply_answer_overrides(results, questions, override_file)
     forced_ids: list[int] = []
     if format_only:
@@ -411,6 +422,14 @@ def build_submission(
         f"输出：{output_path}"
     )
     console.print(f"答案策略：{active_policy.value}")
+    replayed_ids = [
+        result.question_id for result in results
+        if "使用当前执行协议重算历史成功 Operation" in result.warnings
+    ]
+    if replayed_ids:
+        console.print(
+            f"[yellow]确定性重算成功 count {len(replayed_ids)} 题：{replayed_ids}[/yellow]"
+        )
     if forced_ids:
         console.print(f"[yellow]格式安全非空兜底 {len(forced_ids)} 题：{forced_ids}[/yellow]")
 

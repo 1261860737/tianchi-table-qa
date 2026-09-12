@@ -19,6 +19,7 @@ from table_qa_agent.pipeline import (
     find_error_derived_empty_ids,
     force_complete_results,
     publish_submission,
+    replay_trace_result,
     select_submission_results,
     validate_submission,
     write_submission,
@@ -863,6 +864,58 @@ def test_list_result_does_not_receive_object_fields_projection(tmp_path: Path) -
     )
     assert result.final_answer == "[20,10]"
     assert result.recovery_attempts == []
+
+
+def test_success_operation_replay_is_explicit_and_uses_original_plan() -> None:
+    from table_qa_agent.schemas import TaskPlan
+
+    question = QuestionRecord(id=1, file_name="a.png", question_type="thinking",
+                              question="项目数量", answer_format="number")
+    plan = TaskPlan(task_kind="compute_arithmetic", specialist="compute", mode="arithmetic")
+    original = RunResult(
+        question_id=1, question=question.question, document_id="a.png", status="success",
+        plan=plan, final_answer="1", tool_result=1,
+        evidence=EvidenceResponse(
+            question_type="thinking",
+            evidence=[EvidenceItem(value=["甲", "乙", "丙"])],
+            operation=OperationSpec(name="count", arguments={
+                "values": [{"evidence_index": 0}],
+            }),
+        ),
+    )
+    assert replay_trace_result(original, question).final_answer == "1"
+    replayed = replay_trace_result(original, question, replay_success_operation=True)
+    assert replayed.final_answer == "3"
+    assert replayed.plan == plan
+    assert "使用当前执行协议重算历史成功 Operation" in replayed.warnings
+
+
+def test_submission_count_replay_skips_ambiguous_filter_semantics() -> None:
+    from table_qa_agent.schemas import TaskPlan
+
+    question = QuestionRecord(id=1, file_name="a.png", question_type="thinking",
+                              question="不含合计的项目数量", answer_format="number")
+    result = RunResult(
+        question_id=1, question=question.question, document_id="a.png", status="success",
+        plan=TaskPlan(task_kind="compute_arithmetic", specialist="compute"), final_answer="1",
+        evidence=EvidenceResponse(
+            question_type="thinking",
+            evidence=[EvidenceItem(value=["甲", "乙", "合计"])],
+            operation=OperationSpec(name="count", arguments={
+                "values": [{"evidence_index": 0}],
+            }),
+        ),
+    )
+    selected = select_submission_results(
+        [question], [[result]], replay_success_counts=True,
+    )
+    assert selected[0].final_answer == "1"
+    explicit = result.model_copy(deep=True)
+    explicit.evidence.operation.arguments["exclude_values"] = ["合计"]
+    selected = select_submission_results(
+        [question], [[explicit]], replay_success_counts=True,
+    )
+    assert selected[0].final_answer == "2"
 
 
 @pytest.mark.parametrize("name,arguments,answer_format,expected", [

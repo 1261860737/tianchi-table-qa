@@ -89,13 +89,24 @@ def _execute_lookup(arguments: dict[str, Any]) -> Any:
 
 
 def _execute_list(arguments: dict[str, Any]) -> list[Any]:
-    return _values(arguments)
+    values = _values(arguments)
+    if not arguments.get("distinct", False):
+        return values
+    distinct: list[Any] = []
+    for value in values:
+        if value not in distinct:
+            distinct.append(value)
+    return distinct
 
 
 def _execute_count(arguments: dict[str, Any]) -> int:
     values = arguments["source"] if arguments.get("source") is not None else _values(arguments)
+    # count 的对象是“元素集合”。模型可逐项引用，也可引用一条数组 Evidence；
+    # 单一数组只剥一层，绝不递归拍平，避免把分组和嵌套结构混为一谈。
+    if len(values) == 1 and isinstance(values[0], (list, tuple)):
+        values = list(values[0])
     excluded = arguments.get("exclude_values", [])
-    # 仅比较当前层元素，绝不自动展开数组或把已读取的数量再次当作集合。
+    # 仅比较当前层元素，不自动去重。
     return sum(1 for value in values if value not in excluded)
 
 
@@ -477,6 +488,36 @@ def operation_selects_answer(operation: OperationSpec) -> bool:
     ) or (final.name == "list" and final.arguments.get("select_field") is not None)
 
 
+def can_safely_replay_count(
+    operation: OperationSpec,
+    evidence: list[EvidenceItem],
+) -> bool:
+    """判断历史 count 是否已携带足够的集合语义，可安全确定性重算。"""
+    if operation.name != "count":
+        return False
+    try:
+        arguments = _resolve_arguments("count", operation.arguments, evidence, {})
+        values = arguments.get("source") if arguments.get("source") is not None else _values(
+            arguments
+        )
+    except OperationExecutionError:
+        return False
+    if len(values) != 1 or not isinstance(values[0], (list, tuple)):
+        # 多个逐项引用的旧结果没有集合层级歧义，不需要重算。
+        return False
+    members = list(values[0])
+    if arguments.get("exclude_values"):
+        return True
+    # 可能需要过滤但旧 Operation 没有表达过滤语义时，宁可保持历史答案。
+    aggregate_markers = {"合计", "总计", "小计", "subtotal", "total"}
+    return all(
+        member is not None
+        and (not isinstance(member, str) or member.strip())
+        and str(member).strip().casefold() not in aggregate_markers
+        for member in members
+    )
+
+
 def _flatten(value: Any) -> list[Any]:
     if isinstance(value, dict):
         flattened: list[Any] = []
@@ -502,6 +543,7 @@ _CONFIG_ARGUMENT_KEYS = {
     "a_unit",
     "b_unit",
     "exclude_values",
+    "distinct",
 }
 
 

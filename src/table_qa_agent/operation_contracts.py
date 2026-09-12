@@ -20,9 +20,11 @@ class ValuesArguments(Arguments):
 
 class ListArguments(ValuesArguments):
     select_field: str | None = None
+    distinct: bool = False
 
 
 class CountArguments(Arguments):
+    # values 是唯一推荐接口；source 仅兼容 v6 检查点日志，不再向模型公开。
     values: list[Any] | None = None
     source: list[Any] | None = None
     exclude_values: list[Any] = Field(default_factory=list)
