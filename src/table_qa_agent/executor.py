@@ -11,7 +11,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from table_qa_agent.operation_contracts import validate_arguments
-from table_qa_agent.schemas import EvidenceItem, OperationSpec
+from table_qa_agent.schemas import AnswerFormat, AnswerProjection, EvidenceItem, OperationSpec
 
 
 class OperationExecutionError(ValueError):
@@ -444,6 +444,14 @@ def _resolve_arguments(
     step_results: dict[str, Any],
 ) -> dict[str, Any]:
     """在 Evidence 元数据被取值丢弃前，执行显式的列表字段选择。"""
+    if name in {"multiply", "divide", "ratio"}:
+        arguments = dict(arguments)
+        for key in ("a", "b"):
+            if f"{key}_unit" in arguments:
+                continue
+            item = _referenced_evidence_item(arguments.get(key), evidence)
+            if item is not None and _is_percentage_evidence(item):
+                arguments[f"{key}_unit"] = "percent"
     if name == "list" and arguments.get("select_field") is not None:
         field = arguments["select_field"]
         if not isinstance(field, str) or field not in EVIDENCE_REFERENCE_FIELDS:
@@ -459,6 +467,64 @@ def _resolve_arguments(
             selected.append({**reference, "field": field})
         arguments = {**arguments, "values": selected}
     return _resolve_references(arguments, evidence, step_results)
+
+
+def _referenced_evidence_item(
+    reference: Any,
+    evidence: list[EvidenceItem],
+) -> EvidenceItem | None:
+    if not isinstance(reference, dict):
+        return None
+    if "evidence_index" in reference:
+        index = reference["evidence_index"]
+        if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(evidence):
+            return evidence[index]
+    if "evidence_id" in reference:
+        matches = [item for item in evidence if item.id == reference["evidence_id"]]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def _is_percentage_evidence(item: EvidenceItem) -> bool:
+    unit = str(item.unit or "").strip().casefold()
+    if unit in {"%", "％", "percent", "percentage", "百分比"}:
+        return True
+    return isinstance(item.value_raw, str) and item.value_raw.strip().endswith(("%", "％"))
+
+
+def bind_operation_answer_shape(
+    operation: OperationSpec,
+    projection: AnswerProjection | None,
+    answer_format: AnswerFormat,
+) -> tuple[OperationSpec, AnswerProjection | None]:
+    """把无歧义的输出形状绑定到原子操作，避免先丢元数据再投影。"""
+    if operation.name == "list" and projection is not None and projection.mode == "fields":
+        fields = projection.fields
+        values = operation.arguments.get("values")
+        if (
+            len(fields) == 1
+            and isinstance(values, list)
+            and values
+            and all(
+                isinstance(item, dict)
+                and ("evidence_index" in item or "evidence_id" in item)
+                and "field" not in item
+                for item in values
+            )
+        ):
+            arguments = {**operation.arguments, "select_field": fields[0]}
+            return operation.model_copy(update={"arguments": arguments}), None
+    if (
+        operation.name in {"argmax", "argmin"}
+        and operation.arguments.get("return_field") is None
+        and (projection is None or projection.mode == "identity")
+        and answer_format in {"string", "number"}
+    ):
+        return_field = "label" if answer_format == "string" else "value"
+        arguments = {**operation.arguments, "return_field": return_field}
+        return operation.model_copy(update={"arguments": arguments}), None
+    return operation, projection
 
 
 def execute_operation(

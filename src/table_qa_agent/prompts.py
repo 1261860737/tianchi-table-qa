@@ -7,19 +7,6 @@ import json
 from table_qa_agent.schemas import QuestionRecord, SpecialistName, TaskPlan
 from table_qa_agent.structure.contract import STRUCTURE_SCOPE_CONTRACT
 
-COMPUTE_OPERATION_CONTRACT = """
-计算接口只有以下确定含义：
-1. count.values 可以是多个逐项引用，也可以只引用一条数组 Evidence；执行器会对单一数组
-   剥一层后计数。可用 exclude_values 显式排除当前层的空值或合计项；不递归拍平、不去重。
-   已经读到的数量用 lookup，不能 count([数量])。不要使用 source 参数。
-2. argmax/argmin 问名称时设置 return_field="label"，问数值时设置
-   return_field="value"；标签必须包含题目要求的完整实体（如学校和班级）。
-3. add/subtract/multiply/divide/ratio 中，表内 8% 保持 value=8、unit="%"；作为比例
-   参与运算时给对应参数设置 a_unit/b_unit="percent"，由 Python 换算为 0.08。
-   已经是 0.08 的比例使用 number。percentage_point_difference 不做比例换算。
-4. 函数直接返回题目所需值后使用 identity，不再增加重复的末尾投影。
-"""
-
 SYSTEM_PROMPT = """你是复杂表格问答中的专业 Agent。
 你的任务是从给定文档页面中定位最小充分证据。简单单值抽取可直接返回 direct_answer；
 需要计算时选择一个由 Python 执行的确定性 operation。
@@ -65,8 +52,8 @@ SYSTEM_PROMPT = """你是复杂表格问答中的专业 Agent。
 - sum_durations: {"ranges": [{"start": 时间引用, "end": 时间引用}, ...],
   "output_unit": "minute|hour"}
 - argmax/argmin: {"records": [{"label": 标签引用, "value": 数值引用}, ...],
-  "value_field": "value", "label_field": "label", "return_field":"label"}；
-  label 必须解析为非空文本；return_field 指定所需字段，省略时返回完整 record。
+  "value_field": "value", "label_field": "label"}；label 必须解析为非空文本；返回完整
+  record，再通过 answer_projection 选择 label 或 value。
 - boolean: {"value": "是/否或题目要求的简短判断"}
 - concat: {"values": [文本引用, ...], "separator": " "}
 - pipeline: {"steps": [{"id": "唯一id", "name": "上述原子操作",
@@ -184,7 +171,10 @@ SPECIALIST_RULES: dict[SpecialistName, str] = {
 argmax/argmin 的 label 必须引用标签文本或 Evidence 的 row_header/entity；禁止用 divide
 手写平均数，禁止写 60、100、元素个数等派生常数。计算输入太小、缺失或对应关系不清时
 可调用 inspect_table_region；工具返回后必须使用 Evidence + operation 给出最终答案。
-""" + COMPUTE_OPERATION_CONTRACT,
+count 可以逐项引用成员，也可以只引用一条数组 Evidence；两者都由 Python 统计成员数。
+如果题目要求排除空值或合计项，必须在 exclude_values 中明确列出，不要先自行数出结果。
+argmax/argmin 的 label 必须包含题目要求的完整实体，例如学校和班级不能只保留其中一个。
+""",
     "structure": STRUCTURE_SCOPE_CONTRACT + """
 你是 Structure Specialist。recover 模式严格输出 row_count/col_count/cells；measure 模式
 只计算题目要求的结构指标。局部恢复仍需统计完整表格逻辑行列数。
@@ -203,7 +193,7 @@ OPERATION_REPAIR_PROMPT = """你是 Table QA Operation Repair Agent。
 不能修改或补造 Evidence，所有数据参数必须使用 evidence_index/evidence_id 或 step_id 引用。
 时间差用 duration，平均值用 average，标签对应极值用 argmax/argmin，文本拼接用 concat。
 只输出 JSON：{"operation": {...}, "answer_projection": {...}, "output": {...}}。
-""" + COMPUTE_OPERATION_CONTRACT
+"""
 
 
 FORCE_ANSWER_SYSTEM_APPENDIX = """

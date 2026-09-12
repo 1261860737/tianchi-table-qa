@@ -953,6 +953,59 @@ def test_native_answer_selection_is_not_projected_twice(
     assert result.recovery_attempts == []
 
 
+def test_legacy_list_fields_projection_is_bound_before_value_resolution(tmp_path: Path) -> None:
+    from table_qa_agent.schemas import AnswerProjection, TaskPlan
+
+    plan = TaskPlan(task_kind="extract_multi", specialist="extract", mode="multi_field")
+    question = QuestionRecord(id=1, file_name="a.png", question_type="extract",
+                              question="哪些日期满足条件", answer_format="json_array")
+    output = AgentOutput(evidence=EvidenceResponse(
+        question_type="extract",
+        evidence=[EvidenceItem(value="绿色成果", entity="Day 1"),
+                  EvidenceItem(value="绿色成果", entity="Day 3")],
+        operation=OperationSpec(name="list", arguments={
+            "values": [{"evidence_index": 0}, {"evidence_index": 1}],
+        }),
+        answer_projection=AnswerProjection(mode="fields", fields=["entity"]),
+    ), raw_text="{}", usage=TokenUsage())
+    pipeline = BaselinePipeline(
+        resolver=DocumentResolver(tmp_path),
+        processor=DocumentProcessor(DocumentConfig(cache_dir=tmp_path / "cache")),
+        agent=DirectExtractAgent(), runtime=RuntimeConfig(log_dir=tmp_path / "logs"),
+    )
+    result = RunResult(question_id=1, question=question.question, document_id="a.png")
+    pipeline._execute_agent_output(result=result, question=question, plan=plan,
+                                   agent=pipeline.agent, agent_output=output)
+    assert result.final_answer == '["Day 1","Day 3"]'
+
+
+def test_argmax_identity_projection_uses_answer_format_for_scalar_shape(tmp_path: Path) -> None:
+    from table_qa_agent.schemas import TaskPlan
+
+    plan = TaskPlan(task_kind="compute_arg_extreme", specialist="compute", mode="arg_extreme")
+    question = QuestionRecord(id=1, file_name="a.png", question_type="thinking",
+                              question="找出最高分姓名", answer_format="string")
+    output = AgentOutput(evidence=EvidenceResponse(
+        question_type="thinking",
+        evidence=[EvidenceItem(value=91, entity="甲"), EvidenceItem(value=93, entity="乙")],
+        operation=OperationSpec(name="argmax", arguments={"records": [
+            {"label": {"evidence_index": 0, "field": "entity"},
+             "value": {"evidence_index": 0}},
+            {"label": {"evidence_index": 1, "field": "entity"},
+             "value": {"evidence_index": 1}},
+        ]}),
+    ), raw_text="{}", usage=TokenUsage())
+    pipeline = BaselinePipeline(
+        resolver=DocumentResolver(tmp_path),
+        processor=DocumentProcessor(DocumentConfig(cache_dir=tmp_path / "cache")),
+        agent=DirectExtractAgent(), runtime=RuntimeConfig(log_dir=tmp_path / "logs"),
+    )
+    result = RunResult(question_id=1, question=question.question, document_id="a.png")
+    pipeline._execute_agent_output(result=result, question=question, plan=plan,
+                                   agent=pipeline.agent, agent_output=output)
+    assert result.final_answer == "乙"
+
+
 @pytest.mark.parametrize("preferred", ["pipeline", "boolean", "count"])
 def test_pipeline_preference_accepts_single_step_list(tmp_path: Path, preferred: str) -> None:
     """第 22 题：通用 pipeline 建议不能触发对合法 list 的强制修复。"""

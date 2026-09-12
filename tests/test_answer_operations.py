@@ -12,7 +12,6 @@ from table_qa_agent.executor import (
     validate_operation_grounding,
 )
 from table_qa_agent.prompts import (
-    COMPUTE_OPERATION_CONTRACT,
     FORCE_ANSWER_SYSTEM_APPENDIX,
     OPERATION_REPAIR_PROMPT,
     build_question_prompt,
@@ -92,6 +91,14 @@ def test_percentage_conversion_is_explicit_and_decimal(raw: object) -> None:
     })) == 200
 
 
+def test_percentage_unit_is_inferred_from_referenced_evidence() -> None:
+    evidence = [EvidenceItem(value=8.8, unit=None), EvidenceItem(value=8, value_raw="8%", unit="%")]
+    operation = OperationSpec(name="divide", arguments={
+        "a": {"evidence_index": 0}, "b": {"evidence_index": 1},
+    })
+    assert execute_operation(operation, evidence) == Decimal(110)
+
+
 def test_native_selection_works_in_pipeline() -> None:
     operation = OperationSpec.model_validate({"name": "pipeline", "steps": [
         {"id": "name", "name": "concat", "arguments": {
@@ -112,11 +119,11 @@ def test_prompts_share_one_answer_boundary(specialist: str, force: bool) -> None
     prompt = build_specialist_system_prompt(specialist, force_answer=force)
     assert "必须绑定 Evidence" not in prompt
     assert "multi_field 必须使用 Evidence + operation" in prompt
-    assert (COMPUTE_OPERATION_CONTRACT in prompt) == (specialist == "compute")
+    assert "不要使用 source 参数" not in prompt
     question = QuestionRecord(id=1, file_name="a.png", question_type="extract",
                               question="依次读取两个字段", answer_format="json_array")
     user_prompt = build_question_prompt(question, force_answer=force)
     assert "必须绑定 Evidence" not in user_prompt
     if force:
         assert FORCE_ANSWER_SYSTEM_APPENDIX in user_prompt
-    assert COMPUTE_OPERATION_CONTRACT in OPERATION_REPAIR_PROMPT
+    assert "只修复 operation、answer_projection、output" in OPERATION_REPAIR_PROMPT

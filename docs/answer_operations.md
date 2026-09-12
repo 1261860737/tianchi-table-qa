@@ -6,11 +6,11 @@
 ## 实现位置
 
 - `operation_contracts.py`：Pydantic 参数合同。
-- `executor.py`：Decimal 运算、显式字段选择和集合计数。
-- `pipeline.py`：已经选择返回字段的操作不再执行末尾投影，重放使用相同边界。
-- `prompts.py`：仅 Compute 和 Operation 修复接收计算接口说明；Extract/Visual 只接收
-  与字段选择有关的短规则，Structure 不接收答案组装扩展。format-only 的系统和用户
-  指令复用同一常量。
+- `executor.py`：Decimal 运算、百分数单位识别、显式字段选择和集合计数。
+- `pipeline.py`：在 Evidence 元数据丢失前绑定单字段列表投影；argmax/argmin 的标量
+  返回形状由 answer_format 决定；已经选择返回字段的操作不再执行末尾投影。
+- `prompts.py`：沿用原有专家职责，只增加短小的集合语义提示；不向所有专家追加一整套
+  新接口说明。format-only 的系统和用户指令复用同一常量。
 - `tests/test_answer_operations.py`：通用合成回归样本，不包含按评测题号处理的分支。
 
 ## 新参数（可选，兼容旧操作）
@@ -24,7 +24,8 @@
    不递归展开、不自动去重。`source` 只为读取 v6 检查点保留，不再提供给模型。
    已读到的数量使用 lookup，而不是 count([数量])。
 4. 二元运算的 `a_unit/b_unit="percent"`：对应参数的百分数数值除以 100 再运算。
-   默认 number，不根据裸数字推断单位；0.06 与 6% 必须区别声明。
+   Evidence 的 `unit="%"` 或 `value_raw="8%"` 会由代码识别；裸数字不推断单位。
+   显式指定 number 可表示已经归一化的 0.08。
    百分点差操作保持原含义。
 
 这些参数约束执行含义，并不能替模型判断表格语义。历史日志中“单一 Evidence 引用解析

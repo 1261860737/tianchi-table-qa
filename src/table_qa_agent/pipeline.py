@@ -36,6 +36,7 @@ from table_qa_agent.documents import DocumentProcessingError, DocumentProcessor
 from table_qa_agent.executor import (
     ArgumentGroundingError,
     OperationExecutionError,
+    bind_operation_answer_shape,
     can_safely_replay_count,
     execute_operation,
     operation_selects_answer,
@@ -378,6 +379,15 @@ class BaselinePipeline:
         if operation is None:
             raise EvidenceValidationError("operation 不能为空")
         evidence_items = agent_output.evidence.evidence
+        projection = _effective_projection(
+            agent_output.evidence.answer_projection,
+            plan.answer_projection,
+        )
+        operation, projection = bind_operation_answer_shape(
+            operation,
+            projection,
+            question.answer_format,
+        )
         try:
             if self.validate_evidence:
                 validate_operation_grounding(operation, evidence_items)
@@ -397,6 +407,15 @@ class BaselinePipeline:
             operation = repaired.evidence.operation
             if operation is None:
                 raise EvidenceValidationError("修复后的 operation 为空") from exc
+            projection = _effective_projection(
+                repaired.evidence.answer_projection,
+                plan.answer_projection,
+            )
+            operation, projection = bind_operation_answer_shape(
+                operation,
+                projection,
+                question.answer_format,
+            )
             if self.validate_evidence:
                 validate_operation_grounding(operation, evidence_items)
             tool_result = execute_operation(operation, evidence_items)
@@ -451,10 +470,6 @@ class BaselinePipeline:
                         raise StructureRepairError(patch_attempt.reason) from patch_error
 
         result.tool_result = tool_result
-        projection = _effective_projection(
-            agent_output.evidence.answer_projection,
-            plan.answer_projection,
-        )
         if operation_selects_answer(operation):
             projection = None
         # list 已按 arguments.values 顺序组装完毕，不能再次按对象键投影。
@@ -877,13 +892,6 @@ def replay_trace_result(
     if evidence is None or evidence.status != "success" or evidence.operation is None:
         return result
     try:
-        validate_operation_grounding(evidence.operation, evidence.evidence)
-        tool_result = execute_operation(evidence.operation, evidence.evidence)
-        if question.answer_format == "json":
-            try:
-                TableStructureAnswer.model_validate(tool_result)
-            except Exception:
-                tool_result = repair_structure(tool_result)
         # 主动重算成功答案时沿用当时计划，避免把路由/投影变化混入确定性执行器实验。
         # 失败日志可能缺计划，才使用当前规则 Planner 恢复。
         plan = (
@@ -892,7 +900,19 @@ def replay_trace_result(
             else TaskPlanner().plan(question)
         )
         projection = _effective_projection(evidence.answer_projection, plan.answer_projection)
-        if operation_selects_answer(evidence.operation):
+        operation, projection = bind_operation_answer_shape(
+            evidence.operation,
+            projection,
+            question.answer_format,
+        )
+        validate_operation_grounding(operation, evidence.evidence)
+        tool_result = execute_operation(operation, evidence.evidence)
+        if question.answer_format == "json":
+            try:
+                TableStructureAnswer.model_validate(tool_result)
+            except Exception:
+                tool_result = repair_structure(tool_result)
+        if operation_selects_answer(operation):
             projection = None
         try:
             projected_result = project_answer(tool_result, projection)
