@@ -135,7 +135,8 @@ def test_function_calling_intent_planner_returns_policy_checked_plan() -> None:
     result = planner.plan(_question("请用 Net Income 除以 Total Revenue。"))
 
     assert result.plan.specialist == "compute"
-    assert result.plan.preferred_operation == "divide"
+    assert result.plan.preferred_operation is None
+    assert result.plan.answer_projection.mode == "identity"
     assert result.usage.total_tokens == 9
     assert client.kwargs["tool_choice"] == "required"
     assert client.kwargs["image_content"] == []
@@ -163,3 +164,34 @@ def test_function_calling_intent_planner_falls_back_on_policy_violation() -> Non
     assert result.plan.specialist == "structure"
     assert result.plan.task_kind == "structure_recover"
     assert any("回退本地规则" in warning for warning in result.warnings)
+
+
+def test_intent_tool_no_longer_requests_execution_details() -> None:
+    from table_qa_agent.orchestration.planner import INTENT_PLANNER_TOOLS
+
+    client = IntentClient({
+        "task_kind": "compute_arithmetic", "specialist": "compute", "mode": "ratio",
+        "required_fields": [], "needs_localization": False, "needs_ocr": False,
+    })
+    result = FunctionCallingIntentPlanner(client).plan(_question("收入占比是多少？"))
+    assert result.warnings == []
+    assert result.plan.preferred_operation is None
+    schema = INTENT_PLANNER_TOOLS[0]["function"]["parameters"]
+    for field in ("preferred_operation", "answer_projection"):
+        assert field not in schema["properties"]
+        assert field not in schema["required"]
+        assert field not in client.kwargs["user_text"]
+
+
+def test_legacy_model_projection_cannot_override_expert() -> None:
+    client = IntentClient({
+        "task_kind": "compute_boolean", "specialist": "compute", "mode": "multi_field",
+        "required_fields": [], "preferred_operation": "pipeline",
+        "answer_projection": {"mode": "fields", "fields": ["item"]},
+    })
+    result = FunctionCallingIntentPlanner(client).plan(
+        _question("哪些项目有变动？", answer_format="json_array")
+    )
+    assert result.warnings == []
+    assert result.plan.preferred_operation is None
+    assert result.plan.answer_projection.mode == "identity"

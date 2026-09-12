@@ -37,6 +37,7 @@ from table_qa_agent.executor import (
     ArgumentGroundingError,
     OperationExecutionError,
     execute_operation,
+    operation_selects_answer,
     validate_operation_grounding,
 )
 from table_qa_agent.normalizer import (
@@ -62,6 +63,8 @@ from table_qa_agent.schemas import (
     TokenUsage,
 )
 from table_qa_agent.structure import StructureRepairError, repair_structure
+from table_qa_agent.structure.contract import structure_recovery_content
+from table_qa_agent.structure.patch import apply_structure_patch
 from table_qa_agent.verification import assess_evidence
 
 # xlsx 中零长度文本常被读取器还原成 null/NaN。按 answer_format 写入合法的
@@ -322,10 +325,14 @@ class BaselinePipeline:
                 except Exception as exc:
                     result.warnings.append(f"OCR 候选生成失败，继续使用高清区域: {exc}")
             self._wait_for_request_slot()
+            specialist_content = (
+                structure_recovery_content(full_content, region_content)
+                if plan.specialist == "structure" else region_content
+            )
             recovered = self._call_agent(
                 agent,
                 question,
-                region_content,
+                specialist_content,
                 plan=plan,
                 ocr_text=ocr_text,
                 recovery_context=failure_reason,
@@ -344,19 +351,19 @@ class BaselinePipeline:
         plan: TaskPlan,
         agent: Any,
         agent_output: AgentOutput,
+        structure_images: list[dict[str, object]] | None = None,
     ) -> None:
+        result.warnings.extend(agent_output.warnings)
         if agent_output.evidence.direct_answer is not None:
-            if plan.specialist not in {"extract", "visual_attribute"} or plan.mode != "scalar":
+            if plan.specialist not in {"extract", "visual_attribute"}:
                 raise AnswerNormalizationError(
                     f"{plan.specialist}/{plan.mode} 工作流不能绕过确定性 Operation"
                 )
-            if not agent_output.evidence.evidence:
-                raise AnswerNormalizationError("direct_answer 必须绑定至少一条 Evidence")
             result.tool_result = agent_output.evidence.direct_answer
             result.final_answer = normalize_answer(
                 agent_output.evidence.direct_answer,
                 question.answer_format,
-                agent_output.evidence.output,
+                {},
             )
             contract_errors = validate_answer_text(
                 result.final_answer,
@@ -371,7 +378,6 @@ class BaselinePipeline:
             raise EvidenceValidationError("operation 不能为空")
         evidence_items = agent_output.evidence.evidence
         try:
-            _validate_operation_for_plan(plan, operation.name)
             if self.validate_evidence:
                 validate_operation_grounding(operation, evidence_items)
             tool_result = execute_operation(operation, evidence_items)
@@ -390,7 +396,6 @@ class BaselinePipeline:
             operation = repaired.evidence.operation
             if operation is None:
                 raise EvidenceValidationError("修复后的 operation 为空") from exc
-            _validate_operation_for_plan(plan, operation.name)
             if self.validate_evidence:
                 validate_operation_grounding(operation, evidence_items)
             tool_result = execute_operation(operation, evidence_items)
@@ -409,14 +414,48 @@ class BaselinePipeline:
                 try:
                     tool_result = repair_structure(tool_result)
                     attempt.succeeded = True
-                except StructureRepairError:
-                    raise
+                except StructureRepairError as exc:
+                    attempt.reason = str(exc)
+                    propose = getattr(agent, "propose_structure_patch", None)
+                    if (
+                        not self.recovery.enabled or not self.recovery.max_structure_patches
+                        or not structure_images or not callable(propose)
+                        or any(a.action == "patch_structure" for a in result.recovery_attempts)
+                    ):
+                        raise
+                    patch_attempt = RecoveryAttempt(action="patch_structure", reason=str(exc))
+                    result.recovery_attempts.append(patch_attempt)
+                    self._wait_for_request_slot()
+                    try:
+                        patch_images = structure_images
+                        if result.regions and result.document_path:
+                            paths = self.processor.prepare_regions(
+                                result.document_path, result.regions,
+                                roi_dpi=self.retrieval.roi_dpi,
+                                padding_ratio=self.retrieval.padding_ratio,
+                            )
+                            patch_images = structure_recovery_content(
+                                structure_images,
+                                self.processor.as_region_content(paths, result.regions),
+                            )
+                        completion = propose(question, tool_result, patch_images, exc)
+                        self._add_usage(result, completion.usage)
+                        patch_attempt.raw_output = completion.text
+                        tool_result = apply_structure_patch(
+                            tool_result, json.loads(completion.text),
+                        )
+                        patch_attempt.succeeded = True
+                    except Exception as patch_error:
+                        patch_attempt.reason += f"；受限修复失败：{patch_error}"
+                        raise StructureRepairError(patch_attempt.reason) from patch_error
 
         result.tool_result = tool_result
         projection = _effective_projection(
             agent_output.evidence.answer_projection,
             plan.answer_projection,
         )
+        if operation_selects_answer(operation):
+            projection = None
         # list 已按 arguments.values 顺序组装完毕，不能再次按对象键投影。
         if operation.name == "list" and projection is not None and projection.mode == "fields":
             projection = None
@@ -571,6 +610,7 @@ class BaselinePipeline:
                     plan=plan,
                     agent=agent,
                     agent_output=agent_output,
+                    structure_images=full_content,
                 )
             except (
                 AnswerNormalizationError,
@@ -580,7 +620,8 @@ class BaselinePipeline:
                 StructureRepairError,
             ) as exc:
                 if self.recovery.max_visual_retries < 1 or any(
-                    item.action == "locate_crop_ocr" for item in result.recovery_attempts
+                    item.action in {"locate_crop_ocr", "patch_structure"}
+                    for item in result.recovery_attempts
                 ):
                     raise
                 recovered = self._visual_recovery(
@@ -602,6 +643,7 @@ class BaselinePipeline:
                     plan=plan,
                     agent=agent,
                     agent_output=recovered,
+                    structure_images=full_content,
                 )
             self._record_soft_evidence_risks(
                 result=result,
@@ -623,15 +665,19 @@ class BaselinePipeline:
                 raise
             return result
         except Exception as exc:
-            if not self.validate_evidence and isinstance(
-                exc,
-                (
-                    AnswerNormalizationError,
-                    AnswerProjectionError,
-                    ArgumentGroundingError,
-                    OperationExecutionError,
-                    StructureRepairError,
-                ),
+            if (
+                not self.validate_evidence
+                and result.specialist in {"extract", "visual_attribute"}
+                and isinstance(
+                    exc,
+                    (
+                        AnswerNormalizationError,
+                        AnswerProjectionError,
+                        ArgumentGroundingError,
+                        OperationExecutionError,
+                        StructureRepairError,
+                    ),
+                )
             ):
                 result.final_answer = _recover_format_only_answer(
                     question,
@@ -740,22 +786,6 @@ def _classify_error(exc: Exception) -> str:
     return f"SYSTEM_ERROR:{type(exc).__name__}"
 
 
-def _validate_operation_for_plan(plan: TaskPlan, operation_name: str) -> None:
-    """Compute/Structure 的模型操作不得偏离 Python 已批准的计划。"""
-
-    preferred = plan.preferred_operation
-    if plan.specialist not in {"compute", "structure"} or preferred is None:
-        return
-    # pipeline 是通用编排建议，不代表必须使用多步骤；合法单步操作无需重写。
-    # 具体操作仍由 OperationSpec、参数绑定与执行器校验。
-    if preferred == "pipeline" or plan.task_kind == "compute_arithmetic":
-        return
-    if operation_name not in {preferred, "pipeline"}:
-        raise OperationExecutionError(
-            f"{plan.specialist} 工作流要求 {preferred}，模型却返回 {operation_name}"
-        )
-
-
 def _recover_format_only_answer(
     question: QuestionRecord,
     evidence: Iterable[Any],
@@ -851,6 +881,8 @@ def replay_trace_result(result: RunResult, question: QuestionRecord) -> RunResul
         # 日志中的 TaskPlan 可能来自旧协议；重放必须使用当前确定性 Planner。
         plan = TaskPlanner().plan(question)
         projection = _effective_projection(evidence.answer_projection, plan.answer_projection)
+        if operation_selects_answer(evidence.operation):
+            projection = None
         try:
             projected_result = project_answer(tool_result, projection)
         except AnswerProjectionError:

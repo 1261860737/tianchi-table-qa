@@ -285,3 +285,13 @@ ruff check .
 评估 V1，再决定是否只对高风险题增加条件式验证。
 
 接口实现参考阿里云百炼的 [OpenAI 兼容 Chat 文档](https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions) 与 [视觉理解模型说明](https://help.aliyun.com/zh/model-studio/vision-model/)。
+
+## 接口简化变更
+
+当前第一阶段变更、兼容边界及复测命令见 [接口简化说明](docs/interface_simplification.md)。
+
+字段选择、计数粒度、百分数换算及统一提示词边界见
+[可控答案组装接口](docs/answer_operations.md)。新参数显式生效，不自动猜测或覆盖历史答案。
+
+后续边界调整见 [答案保护](docs/answer_boundary.md) 和
+[结构上下文与冲突诊断](docs/structure_context.md)。

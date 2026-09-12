@@ -149,7 +149,11 @@ class DocumentProcessor:
             content.append(
                 {
                     "type": "text",
-                    "text": f"候选区域 {index}，来自原文档第 {reference.page} 页：",
+                    "text": (
+                        f"候选区域 {index}，来自原文档第 {reference.page} 页，"
+                        f"已顺时针旋转 {reference.rotation_degrees} 度以正向阅读；"
+                        "逻辑行列按正向表格解释，不把区域图当作额外表格："
+                    ),
                 }
             )
             content.append(
@@ -175,7 +179,10 @@ class DocumentProcessor:
         for index, region in enumerate(regions, start=1):
             padded = self._padded_bbox(region.bbox, padding_ratio)
             token = hashlib.sha256(
-                f"{path.resolve()}|{path.stat().st_mtime_ns}|{region.page}|{padded}|{roi_dpi}".encode()
+                (
+                    f"{path.resolve()}|{path.stat().st_mtime_ns}|{region.page}|{padded}|"
+                    f"{roi_dpi}|rotation={region.rotation_degrees}"
+                ).encode()
             ).hexdigest()[:20]
             output_dir = self.config.cache_dir / "regions" / token
             output = output_dir / f"region-{index:03d}.jpg"
@@ -193,6 +200,10 @@ class DocumentProcessor:
                     self._render_image_region(path, padded, output)
                 else:
                     raise DocumentProcessingError(f"不支持的文档格式: {path.suffix}")
+                if region.rotation_degrees:
+                    with Image.open(output) as rendered:
+                        rotated = rendered.rotate(-region.rotation_degrees, expand=True)
+                    self._save_pillow_image(rotated, output)
             outputs.append(output)
         return outputs
 

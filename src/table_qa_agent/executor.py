@@ -8,6 +8,9 @@ from datetime import time
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from pydantic import ValidationError
+
+from table_qa_agent.operation_contracts import validate_arguments
 from table_qa_agent.schemas import EvidenceItem, OperationSpec
 
 
@@ -65,7 +68,12 @@ def _values(arguments: dict[str, Any]) -> list[Any]:
 def _binary(arguments: dict[str, Any]) -> tuple[Decimal, Decimal]:
     if "a" not in arguments or "b" not in arguments:
         raise OperationExecutionError("二元操作必须包含 a 和 b")
-    return _number(arguments["a"]), _number(arguments["b"])
+    def operand(key: str) -> Decimal:
+        number = _number(arguments[key])
+        # 显式声明百分数才换算；不改写旧日志中的裸数字或百分点运算。
+        return number / Decimal(100) if arguments.get(f"{key}_unit") == "percent" else number
+
+    return operand("a"), operand("b")
 
 
 def _divide(a: Decimal, b: Decimal) -> Decimal:
@@ -85,7 +93,10 @@ def _execute_list(arguments: dict[str, Any]) -> list[Any]:
 
 
 def _execute_count(arguments: dict[str, Any]) -> int:
-    return len(_values(arguments))
+    values = arguments["source"] if arguments.get("source") is not None else _values(arguments)
+    excluded = arguments.get("exclude_values", [])
+    # 仅比较当前层元素，绝不自动展开数组或把已读取的数量再次当作集合。
+    return sum(1 for value in values if value not in excluded)
 
 
 def _execute_add(arguments: dict[str, Any]) -> Decimal:
@@ -269,12 +280,22 @@ def _execute_arg_extreme(arguments: dict[str, Any], *, find_max: bool) -> dict[s
     return selector(normalized, key=lambda item: item[0])[1]
 
 
-def _execute_argmax(arguments: dict[str, Any]) -> dict[str, Any]:
-    return _execute_arg_extreme(arguments, find_max=True)
+def _extreme_result(arguments: dict[str, Any], *, find_max: bool) -> Any:
+    record = _execute_arg_extreme(arguments, find_max=find_max)
+    field = arguments.get("return_field")
+    if field is None:
+        return record
+    if field not in record:
+        raise OperationExecutionError(f"极值记录缺少返回字段: {field!r}")
+    return record[field]
 
 
-def _execute_argmin(arguments: dict[str, Any]) -> dict[str, Any]:
-    return _execute_arg_extreme(arguments, find_max=False)
+def _execute_argmax(arguments: dict[str, Any]) -> Any:
+    return _extreme_result(arguments, find_max=True)
+
+
+def _execute_argmin(arguments: dict[str, Any]) -> Any:
+    return _extreme_result(arguments, find_max=False)
 
 
 def _execute_boolean(arguments: dict[str, Any]) -> Any:
@@ -320,6 +341,15 @@ def _execute_atomic(name: str, arguments: dict[str, Any]) -> Any:
             f"{name} 参数解析后必须是对象，实际为 {type(arguments).__name__}；"
             'lookup 引用应放在 {"value": 引用} 内'
         )
+    try:
+        if name in OPERATIONS:
+            validate_arguments(name, arguments)
+    except ValidationError as exc:
+        details = "; ".join(
+            f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
+            for error in exc.errors(include_input=False)
+        )
+        raise OperationExecutionError(f"{name} 参数合同不匹配: {details}") from exc
     try:
         executor = OPERATIONS[name]
     except KeyError as exc:
@@ -396,6 +426,30 @@ def _resolve_references(
     return value
 
 
+def _resolve_arguments(
+    name: str,
+    arguments: dict[str, Any],
+    evidence: list[EvidenceItem],
+    step_results: dict[str, Any],
+) -> dict[str, Any]:
+    """在 Evidence 元数据被取值丢弃前，执行显式的列表字段选择。"""
+    if name == "list" and arguments.get("select_field") is not None:
+        field = arguments["select_field"]
+        if not isinstance(field, str) or field not in EVIDENCE_REFERENCE_FIELDS:
+            raise OperationExecutionError(f"不支持的列表 Evidence 字段: {field!r}")
+        selected = []
+        for reference in _values(arguments):
+            if not isinstance(reference, dict) or not (
+                "evidence_index" in reference or "evidence_id" in reference
+            ):
+                raise OperationExecutionError("list.select_field 要求 values 是 Evidence 引用列表")
+            if "field" in reference and reference["field"] != field:
+                raise OperationExecutionError("list.select_field 与单项 field 冲突")
+            selected.append({**reference, "field": field})
+        arguments = {**arguments, "values": selected}
+    return _resolve_references(arguments, evidence, step_results)
+
+
 def execute_operation(
     operation: OperationSpec,
     evidence: list[EvidenceItem] | None = None,
@@ -404,14 +458,23 @@ def execute_operation(
 
     evidence_items = evidence or []
     if operation.name != "pipeline":
-        arguments = _resolve_references(operation.arguments, evidence_items, {})
+        arguments = _resolve_arguments(operation.name, operation.arguments, evidence_items, {})
         return _execute_atomic(operation.name, arguments)
 
     step_results: dict[str, Any] = {}
     for step in operation.steps:
-        arguments = _resolve_references(step.arguments, evidence_items, step_results)
+        arguments = _resolve_arguments(step.name, step.arguments, evidence_items, step_results)
         step_results[step.id] = _execute_atomic(step.name, arguments)
     return step_results[operation.steps[-1].id]
+
+
+def operation_selects_answer(operation: OperationSpec) -> bool:
+    """显式选择过返回字段的操作不再执行旧的末尾投影。"""
+    final = operation.steps[-1] if operation.name == "pipeline" else operation
+    return (
+        final.name in {"argmax", "argmin"}
+        and final.arguments.get("return_field") is not None
+    ) or (final.name == "list" and final.arguments.get("select_field") is not None)
 
 
 def _flatten(value: Any) -> list[Any]:
@@ -434,6 +497,11 @@ _CONFIG_ARGUMENT_KEYS = {
     "label_field",
     "null_policy",
     "separator",
+    "select_field",
+    "return_field",
+    "a_unit",
+    "b_unit",
+    "exclude_values",
 }
 
 

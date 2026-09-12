@@ -135,11 +135,11 @@ def test_force_answer_prompt_disallows_refusal_and_keeps_format_contract() -> No
     prompt = build_question_prompt(_question(), force_answer=True)
     system_prompt = build_specialist_system_prompt("extract", force_answer=True)
 
-    assert "可以先调用工具" in prompt
-    assert "必须返回 status=success 和一个非空答案" in prompt
-    assert "仍须严格满足题目的 answer_format" in prompt
+    assert "优先调用工具" in prompt
+    assert "必须返回 status=success" in prompt
+    assert "最终值必须非空，且严格满足题目的 answer_format" in prompt
     assert "format-only 答案策略（优先于上面的证据不足与拒答规则）" in system_prompt
-    assert "direct_answer，且必须绑定 Evidence" in system_prompt
+    assert "Evidence 可选且不作为拒答条件" in system_prompt
 
 
 def test_extract_agent_can_request_shared_table_inspection_tool() -> None:

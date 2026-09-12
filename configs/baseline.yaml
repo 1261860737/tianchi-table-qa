@@ -49,3 +49,5 @@ recovery:
   # Extract/Compute Agent 每题最多主动请求一次共享表格检查工具，避免循环调用。
   max_agent_tool_calls: 1
   repair_structure_dimensions: true
+  # 结构几何冲突最多请求一次受限补丁，只能改冲突单元格的位置和跨度。
+  max_structure_patches: 1

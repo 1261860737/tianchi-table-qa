@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from table_qa_agent.config import DocumentConfig
@@ -36,3 +37,29 @@ def test_high_resolution_region_is_cropped_from_original_image(tmp_path: Path) -
 
     with Image.open(outputs[0]) as image:
         assert image.size == (500, 300)
+
+
+@pytest.mark.parametrize("angle,size", [(0, (100, 60)), (90, (60, 100)),
+                                       (180, (100, 60)), (270, (60, 100))])
+def test_region_rotation_is_explicit_and_cache_safe(
+    tmp_path: Path, angle: int, size: tuple[int, int],
+) -> None:
+    source = tmp_path / "table.png"
+    original = Image.new("RGB", (100, 60), "white")
+    original.paste("red", (0, 0, 40, 20))
+    original.save(source)
+    processor = DocumentProcessor(DocumentConfig(cache_dir=tmp_path / "cache"))
+    ref = RegionRef(page=1, bbox=(0, 0, 1, 1), rotation_degrees=angle)
+    output = processor.prepare_regions(source, [ref], padding_ratio=0)
+    assert output == processor.prepare_regions(source, [ref], padding_ratio=0)
+    with Image.open(output[0]) as result:
+        assert result.size == size
+        if angle == 90:
+            red, green, blue = result.getpixel((50, 10))
+            assert red > 180 and green < 80 and blue < 80
+    unrotated = processor.prepare_regions(
+        source, [RegionRef(page=1, bbox=(0, 0, 1, 1))], padding_ratio=0,
+    )
+    assert (output == unrotated) == (angle == 0)
+    with Image.open(source) as unchanged:
+        assert unchanged.size == (100, 60)

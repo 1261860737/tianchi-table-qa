@@ -287,6 +287,51 @@ class FakeOCR:
         return OCRResult(blocks=[OCRTextBlock(text="目标字段 42")]), TokenUsage(total_tokens=1)
 
 
+@pytest.mark.parametrize("specialist", ["structure", "extract"])
+def test_visual_recovery_preserves_full_pages_only_for_structure(
+    tmp_path: Path, specialist: str,
+) -> None:
+    from table_qa_agent.schemas import TaskPlan
+
+    class RecordingAgent:
+        content = None
+
+        def run(self, question, image_content, **kwargs):
+            self.content = image_content
+            return AgentOutput(
+                evidence=EvidenceResponse(question_type=question.question_type),
+                raw_text="{}", usage=TokenUsage(),
+            )
+
+    Image.new("RGB", (100, 100), "white").save(tmp_path / "001.png")
+    agent = RecordingAgent()
+    pipeline = BaselinePipeline(
+        resolver=DocumentResolver(tmp_path),
+        processor=DocumentProcessor(DocumentConfig(cache_dir=tmp_path / "cache")),
+        agent=agent, locator=FakeLocator(), runtime=RuntimeConfig(log_dir=tmp_path / "logs"),
+    )
+    question = QuestionRecord(
+        id=1, file_name="001.png", question_type=specialist,
+        question="读取目标区域", answer_format="json" if specialist == "structure" else "string",
+    )
+    plan = TaskPlan(
+        task_kind="structure_recover" if specialist == "structure" else "extract_scalar",
+        specialist=specialist,
+    )
+    full = [{"type": "text", "text": "原始第1页"}, {"type": "text", "text": "原始第2页"}]
+    output = pipeline._visual_recovery(
+        result=RunResult(question_id=1, question=question.question, document_id="001.png"),
+        question=question, plan=plan, agent=agent, document_path=tmp_path / "001.png",
+        full_content=full, failure_reason="补读",
+    )
+    assert output is not None
+    assert (full[0] in agent.content) == (specialist == "structure")
+    if specialist == "structure":
+        assert agent.content[1:3] == full
+        assert "高清局部图" in agent.content[3]["text"]
+    assert len(full) == 2
+
+
 class RepairingOperationAgent:
     def run(self, *_: object, **__: object) -> AgentOutput:
         return AgentOutput(
@@ -702,6 +747,60 @@ def test_extract_workflow_can_submit_direct_answer_without_operation(tmp_path: P
     assert result.evidence is not None and result.evidence.operation is None
 
 
+@pytest.mark.parametrize("mode", ["scalar", "single_value", "filter", "multi_field"])
+def test_direct_answer_is_not_denied_by_mode_or_missing_evidence(tmp_path: Path, mode: str) -> None:
+    from table_qa_agent.schemas import TaskPlan
+
+    question = QuestionRecord(
+        id=838, file_name="001.png", question_type="extract",
+        question="提取 email_id", answer_format="string",
+    )
+    pipeline = BaselinePipeline(
+        resolver=DocumentResolver(tmp_path),
+        processor=DocumentProcessor(DocumentConfig(cache_dir=tmp_path / "cache")),
+        agent=DirectExtractAgent(), runtime=RuntimeConfig(log_dir=tmp_path / "logs"),
+    )
+    result = RunResult(question_id=838, question=question.question, document_id="001.png")
+    output = AgentOutput(
+        evidence=EvidenceResponse(question_type="extract", direct_answer="example@gmail.com"),
+        raw_text="{}", usage=TokenUsage(),
+    )
+    pipeline._execute_agent_output(
+        result=result, question=question,
+        plan=TaskPlan(task_kind="extract_scalar", specialist="extract", mode=mode),
+        agent=pipeline.agent, agent_output=output,
+    )
+    assert result.final_answer == "example@gmail.com"
+    assert result.recovery_attempts == []
+
+
+def test_failed_computation_does_not_submit_first_evidence_value(tmp_path: Path) -> None:
+    from table_qa_agent.config import RecoveryConfig
+
+    class FailedComputeAgent:
+        def run(self, *args: object, **kwargs: object) -> AgentOutput:
+            return AgentOutput(
+                evidence=EvidenceResponse(
+                    question_type="thinking", evidence=[EvidenceItem(value=123)],
+                    operation=OperationSpec(name="divide", arguments={"a": 123, "b": 0}),
+                ), raw_text="{}", usage=TokenUsage(),
+            )
+
+    Image.new("RGB", (20, 20), "white").save(tmp_path / "001.png")
+    pipeline = BaselinePipeline(
+        resolver=DocumentResolver(tmp_path),
+        processor=DocumentProcessor(DocumentConfig(cache_dir=tmp_path / "cache")),
+        agent=FailedComputeAgent(), runtime=RuntimeConfig(log_dir=tmp_path / "logs"),
+        recovery=RecoveryConfig(enabled=False), validate_evidence=False,
+    )
+    result = pipeline.run_one(QuestionRecord(
+        id=1, file_name="001.png", question_type="thinking",
+        question="计算两项比值", answer_format="number",
+    ))
+    assert result.status == "error"
+    assert result.final_answer is None
+
+
 def test_extract_agent_can_call_shared_locator_crop_ocr_tool(tmp_path: Path) -> None:
     files_dir = tmp_path / "files"
     files_dir.mkdir()
@@ -766,13 +865,49 @@ def test_list_result_does_not_receive_object_fields_projection(tmp_path: Path) -
     assert result.recovery_attempts == []
 
 
-def test_pipeline_preference_accepts_single_step_list(tmp_path: Path) -> None:
+@pytest.mark.parametrize("name,arguments,answer_format,expected", [
+    ("list", {"values": [{"evidence_index": 0}], "select_field": "entity"},
+     "json_array", '["乙校 / 二班"]'),
+    ("argmax", {"records": [{"label": {"evidence_index": 0, "field": "entity"},
+                             "value": {"evidence_index": 0}}], "return_field": "label"},
+     "string", "乙校 / 二班"),
+])
+def test_native_answer_selection_is_not_projected_twice(
+    tmp_path: Path, name: str, arguments: dict, answer_format: str, expected: str,
+) -> None:
+    from table_qa_agent.schemas import AnswerProjection, TaskPlan
+
+    plan = TaskPlan(
+        task_kind="compute_arg_extreme", specialist="compute", mode="arg_extreme",
+        answer_projection=AnswerProjection(mode="path", path=["label"]),
+    )
+    question = QuestionRecord(id=1, file_name="a.png", question_type="thinking",
+                              question="返回匹配的学校和班级", answer_format=answer_format)
+    output = AgentOutput(evidence=EvidenceResponse(
+        question_type="thinking", evidence=[EvidenceItem(value=18, entity="乙校 / 二班")],
+        operation=OperationSpec(name=name, arguments=arguments),
+        answer_projection=plan.answer_projection,
+    ), raw_text="{}", usage=TokenUsage())
+    pipeline = BaselinePipeline(
+        resolver=DocumentResolver(tmp_path),
+        processor=DocumentProcessor(DocumentConfig(cache_dir=tmp_path / "cache")),
+        agent=DirectExtractAgent(), runtime=RuntimeConfig(log_dir=tmp_path / "logs"),
+    )
+    result = RunResult(question_id=1, question=question.question, document_id="a.png")
+    pipeline._execute_agent_output(result=result, question=question, plan=plan,
+                                   agent=pipeline.agent, agent_output=output)
+    assert result.final_answer == expected
+    assert result.recovery_attempts == []
+
+
+@pytest.mark.parametrize("preferred", ["pipeline", "boolean", "count"])
+def test_pipeline_preference_accepts_single_step_list(tmp_path: Path, preferred: str) -> None:
     """第 22 题：通用 pipeline 建议不能触发对合法 list 的强制修复。"""
     from table_qa_agent.schemas import AnswerProjection, TaskPlan
 
     plan = TaskPlan(
         task_kind="compute_boolean", specialist="compute", mode="multi_field",
-        preferred_operation="pipeline",
+        preferred_operation=preferred,
         answer_projection=AnswerProjection(mode="fields", fields=["item"]),
     )
     question = QuestionRecord(

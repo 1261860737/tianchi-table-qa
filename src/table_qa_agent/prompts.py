@@ -5,17 +5,45 @@ from __future__ import annotations
 import json
 
 from table_qa_agent.schemas import QuestionRecord, SpecialistName, TaskPlan
+from table_qa_agent.structure.contract import STRUCTURE_SCOPE_CONTRACT
+
+ANSWER_OPERATION_CONTRACT = """
+答案组装接口（原子操作直接返回所需值，answer_projection 使用 identity）：
+1. 问“哪些天/哪些公司/姓名”时返回对应的 entity、column_header 或 row_header，
+   不要返回用于筛选它们的数值或标签内容。逐项引用必须明确 field。
+   同一字段的列表可使用 list: {"values":[{"evidence_index":0},{"evidence_index":1}],
+   "select_field":"entity"}。select_field 在取值之前执行，只接受 Evidence 引用。
+   混合字段列表在每个引用中指定 field，不再添加末尾 fields 投影。
+2. argmax/argmin 支持 return_field。问名称使用 "return_field":"label"；问数值使用
+   "return_field":"value"；仅在明确要求整条记录时省略。label 必须保留完整实体，
+   例如学校和班级一起作为标签，不得只留下班级。组合标签可先用 concat，再引用步骤结果。
+3. count 的 values 是待统计的逐项元素；source 是一条数组 Evidence 的直接引用。
+   二者只能提供一个。统计数组请用 {"source":{"evidence_index":0}}，
+   不要写 {"values":[{"evidence_index":0}]} 来包住整条数组。
+   可用 exclude_values:["",null] 显式排除空元素；不自动拍平、不自动去重或排除任何值。
+   需要排除某类元素时先按其标签选择成员，不能靠数字大小或数组位置猜测。
+   图中已经给出的数量使用 lookup，不能 count([已读取数量])。
+   需要计算数量时提取实际成员，不要把模型数出的数量放进 Evidence 再 count。
+4. add/subtract/multiply/divide/ratio 支持 a_unit、b_unit，取值 number 或 percent。
+   表中 8% 可保持 value=8、unit="%"，作为比例参与运算时设置对应的 b_unit="percent"，
+   由 Python 换算为 0.08；已经是 0.08 的比例用 number，避免再次除以 100。
+   例如税额除以税率使用 divide: {"a":{"evidence_index":0},
+   "b":{"evidence_index":1},"b_unit":"percent"}。不手写换算常数。
+   percentage_point_difference 仍使用百分数数值，返回百分点差，不做比例换算。
+5. 输出内容必须与题目要求一一对应；不附加未要求的实体名、数值或记录包装。
+   不通过辅助 Evidence 重新否决或改写可用的 direct_answer。
+"""
 
 SYSTEM_PROMPT = """你是复杂表格问答中的专业 Agent。
-你的任务是从给定文档页面中定位最小充分证据。简单单值抽取可直接返回 direct_answer；
+你的任务是从给定文档页面中读取答案或定位最小充分证据。非计算抽取可直接返回 direct_answer；
 需要计算时选择一个由 Python 执行的确定性 operation。
 
 硬性规则：
 1. 只能使用图中可见内容，不能依靠常识补全或猜测。
-2. 不要自行完成算术；计算由 Python 完成。只有 Extract/Visual 的 scalar 模式可以填写
-   direct_answer，并且必须同时返回至少一条与答案一致的 Evidence。
-3. 每个证据都要给出 row_header、column_header、value_raw、规范化 value、unit
-   和 1-based page。
+2. 不要自行完成算术；计算由 Python 完成。Extract/Visual 可填写 direct_answer，
+   Evidence 是可选辅助信息；不要因无法填写定位信息而放弃已读到的答案。
+3. 如提供 Evidence，记录可见的 row_header、column_header、value_raw、规范化 value、unit
+   和 1-based page；无法确定的定位信息不要编造，不影响 Extract/Visual 的直接回答。
 4. value 必须忠实于 value_raw：数字去掉千分位和单位后写成 JSON 数字；
    文本写成字符串；多项写成数组。数组中的空值必须写成空字符串 ""，禁止 null。
 5. operation.arguments 优先引用 evidence，而不是重复抄写值：
@@ -33,7 +61,8 @@ SYSTEM_PROMPT = """你是复杂表格问答中的专业 Agent。
 10. 为每条 Evidence 设置稳定 id，并填写 role、value_type；能定位时填写归一化 bbox。
 11. 先根据 task_plan.required_fields 收集完整字段，再生成 operation；不能为了得到最终值而
     丢失标签、名称、行头等关联字段。
-12. operation 完成后，answer_projection 指明最终需要返回完整结果、某个路径或多个字段。
+12. 优先在 operation 内明确返回字段，answer_projection 使用 identity；
+    path/fields 仅用于兼容旧的完整结果投影，不与原子操作中的字段选择重复使用。
 13. role=label 的 Evidence.value 必须是标签文本；如果标签只存在于 row_header/entity，
     Operation 的 label 引用必须显式指定 field=row_header 或 field=entity，不能默认取数值。
 
@@ -50,8 +79,8 @@ SYSTEM_PROMPT = """你是复杂表格问答中的专业 Agent。
 - sum_durations: {"ranges": [{"start": 时间引用, "end": 时间引用}, ...],
   "output_unit": "minute|hour"}
 - argmax/argmin: {"records": [{"label": 标签引用, "value": 数值引用}, ...],
-  "value_field": "value", "label_field": "label"}；label 必须解析为非空文本；返回完整
-  record，再通过 answer_projection 选择 label 或 value。
+  "value_field": "value", "label_field": "label", "return_field":"label"}；
+  label 必须解析为非空文本；return_field 指定所需字段，省略时返回完整 record。
 - boolean: {"value": "是/否或题目要求的简短判断"}
 - concat: {"values": [文本引用, ...], "separator": " "}
 - pipeline: {"steps": [{"id": "唯一id", "name": "上述原子操作",
@@ -110,15 +139,16 @@ SYSTEM_PROMPT = """你是复杂表格问答中的专业 Agent。
 - structure 且 answer_format=json：必须严格使用下方“结构恢复协议”，不能输出
   普通数组、二维数组或自定义 headers/rows 对象。
 - structure 且 answer_format=number：题目只询问行数或列数，使用 count 或 lookup 数字。
-- extract：scalar 单值可填写 direct_answer，operation=null，但必须绑定 Evidence；多字段列表
-  必须使用 list。
+- Extract/Visual 的单值和多字段抽取均可填写 direct_answer，operation=null，Evidence 可选。
+  多字段按题目顺序组装；需要使用函数时才提供 Evidence + operation。
 - thinking：先列出所有参与计算/判断的证据，再选择语义操作。
 - answer_format=number：最终必须是单个数字，不附加单位。
-- answer_format=json_array：operation 的结果必须是 JSON 数组，顺序严格按题目；
-  空单元格使用 ""。若答案是一行、一列或一个区域，数组元素使用简单键值对象。
+- answer_format=json_array：最终答案必须是 JSON 数组，顺序严格按题目；
+  空单元格使用 ""。按顺序询问若干值时返回值数组，不加额外对象或嵌套数组；
+  只有明确要求名称与数值配对时使用键值对象。
 - answer_format=json：只用于结构恢复，必须符合结构恢复协议。
 - answer_format=string：保持表内原文；若问题要求百分号或固定小数，
-  在 output.suffix/decimals 中声明。
+  operation 路径在 output.suffix/decimals 中声明；direct_answer 本身包含最终格式。
 
 结构恢复协议：
 1. value 必须是且只能是以下对象：
@@ -156,8 +186,8 @@ SYSTEM_PROMPT = """你是复杂表格问答中的专业 Agent。
 SPECIALIST_RULES: dict[SpecialistName, str] = {
     "extract": """
 你是 Extract Specialist。优先保持原文及行列关联；多字段任务必须按 required_fields
-逐项取证，并按题目顺序构造 list。单值抽取可使用 direct_answer，但必须同时返回包含同一
-值的 Evidence；
+逐项读取并按题目顺序组织答案。可使用 direct_answer；Evidence 仅作为辅助记录，
+缺少 Evidence 或定位信息不应否定已读取的答案；
 不要做自由计算。原页面文字太小或行列关系不清时可调用 inspect_table_region，获得高清
 区域和 OCR 后再给出最终答案；内容已经清楚时直接回答，不要为了调用工具而调用工具。
 """,
@@ -168,13 +198,14 @@ argmax/argmin 的 label 必须引用标签文本或 Evidence 的 row_header/enti
 手写平均数，禁止写 60、100、元素个数等派生常数。计算输入太小、缺失或对应关系不清时
 可调用 inspect_table_region；工具返回后必须使用 Evidence + operation 给出最终答案。
 """,
-    "structure": """
+    "structure": STRUCTURE_SCOPE_CONTRACT + """
 你是 Structure Specialist。recover 模式严格输出 row_count/col_count/cells；measure 模式
 只计算题目要求的结构指标。局部恢复仍需统计完整表格逻辑行列数。
 """,
     "visual_attribute": """
 你是 Visual Attribute Specialist。处理颜色、方向、布局、是否存在某类视觉元素等问题。
-不要求图片中存在与问题同名的字段，但必须在 source_text/target 中描述可见依据。
+允许直接回答，Evidence 可选。不要求图片中存在与问题同名的字段；如提供 Evidence，
+在 source_text/target 中描述可见依据，不因辅助记录缺失而放弃答案。
 """,
 }
 
@@ -184,7 +215,7 @@ OPERATION_REPAIR_PROMPT = """你是 Table QA Operation Repair Agent。
 不能修改或补造 Evidence，所有数据参数必须使用 evidence_index/evidence_id 或 step_id 引用。
 时间差用 duration，平均值用 average，标签对应极值用 argmax/argmin，文本拼接用 concat。
 只输出 JSON：{"operation": {...}, "answer_projection": {...}, "output": {...}}。
-"""
+""" + ANSWER_OPERATION_CONTRACT
 
 
 FORCE_ANSWER_SYSTEM_APPENDIX = """
@@ -192,8 +223,8 @@ format-only 答案策略（优先于上面的证据不足与拒答规则）：
 1. 若当前允许调用 inspect_table_region，且原图不足以可靠读取，优先调用工具；工具调用是
    中间步骤，不视为拒答。工具不可用或已调用后必须返回 status=success。
 2. 找不到完全同名字段时，选择图中语义或位置最接近的候选并作最佳判断。
-3. 只有 Extract/Visual 的 scalar 模式允许 direct_answer，且必须绑定 Evidence；Compute、
-   Structure 和 multi_field 必须使用 Evidence + operation。operation 参数优先引用 Evidence。
+3. Extract/Visual 允许 direct_answer，Evidence 可选且不作为拒答条件；Compute、
+   Structure 必须使用 Evidence + operation。operation 参数优先引用 Evidence。
 4. 数字目标显示破折号、空白或缺失时输出 0。
 5. 字符串目标找不到可见候选时输出“未知”；数组使用 ["未知"]；禁止最终答案为空字符串。
 6. 最终值必须非空，且严格满足题目的 answer_format。
@@ -205,7 +236,7 @@ def build_specialist_system_prompt(
     *,
     force_answer: bool = False,
 ) -> str:
-    prompt = SYSTEM_PROMPT + "\n\n" + SPECIALIST_RULES[specialist]
+    prompt = SYSTEM_PROMPT + "\n\n" + SPECIALIST_RULES[specialist] + ANSWER_OPERATION_CONTRACT
     if force_answer:
         prompt += "\n\n" + FORCE_ANSWER_SYSTEM_APPENDIX
     return prompt
@@ -246,16 +277,7 @@ def build_question_prompt(
     if recovery_context:
         instruction += "\n这是一次失败恢复，请针对以下错误修正：\n" + recovery_context
     if force_answer:
-        instruction += (
-            "\n本次运行使用 format-only 答案策略：若当前开放 inspect_table_region 且原图不足以"
-            "可靠读取，可以先调用工具；否则必须返回 status=success 和一个非空答案。若找不到完全"
-            "同名字段，请选择图中语义或位置最接近的可见候选并给出最佳判断。只有 Extract/Visual "
-            "的 scalar 模式允许 direct_answer，且必须绑定 Evidence；其他工作流必须使用 Evidence "
-            "+ operation。"
-            "数字单元格显示破折号、"
-            "空白或缺失时输出 0；字符串无候选时输出“未知”，数组无候选时输出 [\"未知\"]。"
-            "禁止最终答案为空字符串，且仍须严格满足题目的 answer_format。"
-        )
+        instruction += "\n" + FORCE_ANSWER_SYSTEM_APPENDIX
     if question.answer_format == "json":
         instruction += (
             "\n本题是结构恢复题。最终工具结果必须严格包含 row_count、col_count、cells；"

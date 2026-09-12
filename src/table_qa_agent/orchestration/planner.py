@@ -61,7 +61,7 @@ INTENT_PLANNER_TOOLS: list[dict[str, object]] = [
         "function": {
             "name": INTENT_PLANNER_TOOL_NAME,
             "description": (
-                "分析表格问答意图，声明任务类型、专家、所需字段、确定性操作和视觉能力。"
+                "分析表格问答意图，声明任务类型、专家、所需字段和视觉能力。"
                 "这里只生成计划，不读取图片、不回答问题、不执行计算。"
             ),
             "parameters": {
@@ -128,29 +128,6 @@ INTENT_PLANNER_TOOLS: list[dict[str, object]] = [
                             "additionalProperties": False,
                         },
                     },
-                    "preferred_operation": {
-                        "type": ["string", "null"],
-                        "enum": [*sorted(_ALLOWED_OPERATIONS), None],
-                    },
-                    "answer_projection": {
-                        "type": "object",
-                        "properties": {
-                            "mode": {
-                                "type": "string",
-                                "enum": ["identity", "path", "fields"],
-                            },
-                            "path": {
-                                "type": "array",
-                                "items": {"type": ["string", "integer"]},
-                            },
-                            "fields": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "required": ["mode", "path", "fields"],
-                        "additionalProperties": False,
-                    },
                     "needs_localization": {"type": "boolean"},
                     "needs_ocr": {"type": "boolean"},
                 },
@@ -159,8 +136,6 @@ INTENT_PLANNER_TOOLS: list[dict[str, object]] = [
                     "specialist",
                     "mode",
                     "required_fields",
-                    "preferred_operation",
-                    "answer_projection",
                     "needs_localization",
                     "needs_ocr",
                 ],
@@ -179,9 +154,9 @@ INTENT_PLANNER_PROMPT = """你是表格问答 Intent Planner，只分析题目�
 3. 极值询问标签用 compute_arg_extreme，询问数值用 compute_extreme。
 4. 表格行列数和合并结构使用 structure；颜色、方向、布局、图片存在性使用 visual_attribute。
 5. required_fields 只声明完成任务所需的原始字段，不能填写答案或中间计算结果。
-6. preferred_operation 只允许选择白名单 Python 操作；复杂计算可选 pipeline。
-7. needs_ocr 表示这类任务默认必须先 OCR；不确定是否需要时填 false，由专家后续请求能力。
-8. answer_projection 只描述 Python 工具结果如何映射到最终答案。
+6. 不指定具体操作或答案投影，由看过图片的专家决定；不要输出 preferred_operation、
+   answer_projection。
+7. needs_ocr 仅记录读取需求，不会强制先执行 OCR；专家可在看图后请求补读。
 """
 
 
@@ -359,7 +334,9 @@ class FunctionCallingIntentPlanner:
             "question": question.question,
             "table_hint": question.table_hint,
             "answer_format": question.answer_format,
-            "rule_plan_hint": fallback_plan.model_dump(mode="json"),
+            "rule_plan_hint": fallback_plan.model_dump(
+                mode="json", exclude={"preferred_operation", "answer_projection"}
+            ),
         }
         try:
             completion = self.client.complete(
@@ -438,6 +415,8 @@ def _apply_plan_policy(
         "compute",
     }:
         raise ValueError("视觉属性题不能降级为普通文本抽取")
-    if candidate.preferred_operation == "list":
-        candidate = candidate.model_copy(update={"answer_projection": AnswerProjection()})
-    return candidate
+    # 兼容旧响应，但不让规划模型的操作/投影指令影响专家执行。
+    return candidate.model_copy(update={
+        "preferred_operation": None,
+        "answer_projection": AnswerProjection(),
+    })

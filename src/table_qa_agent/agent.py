@@ -9,6 +9,7 @@ from json_repair import loads as repair_json_loads
 
 from table_qa_agent.capabilities import AGENT_TOOL_DEFINITIONS, validate_tool_call
 from table_qa_agent.client import ModelCompletion, ModelToolCall, OpenAICompatibleVLClient
+from table_qa_agent.normalizer import normalize_answer, validate_answer_text
 from table_qa_agent.prompts import (
     FORCE_ANSWER_SYSTEM_APPENDIX,
     OPERATION_REPAIR_PROMPT,
@@ -25,6 +26,8 @@ from table_qa_agent.schemas import (
     TaskPlan,
     TokenUsage,
 )
+from table_qa_agent.structure.contract import STRUCTURE_SCOPE_CONTRACT
+from table_qa_agent.structure.patch import conflict_indices
 
 
 class EvidenceValidationError(ValueError):
@@ -48,6 +51,7 @@ class AgentOutput:
     raw_text: str
     usage: TokenUsage
     tool_calls: list[ModelToolCall] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 class EvidenceAgent:
@@ -142,14 +146,53 @@ class EvidenceAgent:
                 usage=completion.usage,
                 tool_calls=completion.tool_calls,
             )
+        # 抽取答案先按最终合同检查；辅助 Evidence 不具有否决权。
+        if specialist in {"extract", "visual_attribute"} and question.answer_format != "json":
+            direct = parse_direct_response(completion.text, question)
+            if direct is not None:
+                evidence, warnings = direct
+                return AgentOutput(
+                    evidence=evidence, raw_text=completion.text,
+                    usage=completion.usage, warnings=warnings,
+                )
+        protocol_warnings: list[str] = []
         try:
             evidence = parse_evidence_response(completion.text)
+            if specialist == "compute" and evidence.operation is None:
+                raise ValueError("计算响应缺少 operation，不能使用模型最终答案替代计算")
         except Exception as exc:
-            raise EvidenceValidationError(
-                "模型输出无法解析为 Evidence JSON",
-                raw_text=completion.text,
-                usage=completion.usage,
-            ) from exc
+            if specialist != "compute" or recovery_context is None:
+                raise EvidenceValidationError(
+                    f"模型输出无法解析为 Evidence JSON: {exc}",
+                    raw_text=completion.text, usage=completion.usage,
+                ) from exc
+            # 只在已经进入补读恢复的计算题增加一次协议修复，不递归重试。
+            initial = completion
+            retry = self.client.complete(
+                system_prompt=system_prompt,
+                user_text=build_question_prompt(question, plan, ocr_text=ocr_text)
+                + "\n上次响应缺少必要计算协议。请重新从图片读取操作数，不把上次答案当作证据。"
+                + "必须返回 question_type、evidence、operation 和 output；禁止仅返回 answer。"
+                + "选择最简单的 Python 操作并引用证据，禁止自行计算最终值。",
+                image_content=image_content,
+            )
+            usage = TokenUsage(**{
+                key: (getattr(initial.usage, key) or 0) + (getattr(retry.usage, key) or 0)
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+            })
+            completion = ModelCompletion(text=retry.text, usage=usage)
+            try:
+                evidence = parse_evidence_response(completion.text)
+                if evidence.operation is None or not evidence.evidence:
+                    raise ValueError("协议修复后仍缺少 Evidence 或 Operation")
+            except Exception as retry_error:
+                raise EvidenceValidationError(
+                    f"计算协议修复失败: {retry_error}",
+                    raw_text=completion.text, usage=usage,
+                ) from retry_error
+            protocol_warnings.append(
+                f"计算协议缺失，已重新读取操作数并修复一次；原始响应：{initial.text}"
+            )
 
         if self.validate_evidence and evidence.status == "success":
             if evidence.operation is None and evidence.direct_answer is None:
@@ -187,6 +230,25 @@ class EvidenceAgent:
             evidence=evidence,
             raw_text=completion.text,
             usage=completion.usage,
+            warnings=protocol_warnings,
+        )
+
+    def propose_structure_patch(
+        self, question: QuestionRecord, value: dict[str, object],
+        image_content: list[dict[str, object]], error: Exception,
+    ) -> ModelCompletion:
+        return self.client.complete(
+            system_prompt=STRUCTURE_SCOPE_CONTRACT + "\n"
+            "你是结构几何修复器。对照图片，只修正 allowed_indices 中单元格的位置或跨度。"
+            "父级表头有子级并不表示父级占据子级所在行；以实际可见边界为准。"
+            "禁止修改文本、其他单元格和整表尺寸，禁止删格或新增格。"
+            '只返回 JSON：{"updates":[{"index":0,"row":0,"col":0,"rowspan":1,"colspan":1}]}。'
+            '无法在此边界内确定修复时返回 {"updates":[]}，不要强行猜测。',
+            user_text=json.dumps({
+                "question": question.question, "candidate": value,
+                "allowed_indices": conflict_indices(value), "error": str(error),
+            }, ensure_ascii=False),
+            image_content=image_content,
         )
 
     def repair_operation(
@@ -235,6 +297,33 @@ class EvidenceAgent:
                 usage=completion.usage,
             ) from exc
         return AgentOutput(evidence=repaired, raw_text=completion.text, usage=completion.usage)
+
+
+def parse_direct_response(
+    text: str, question: QuestionRecord,
+) -> tuple[EvidenceResponse, list[str]] | None:
+    """只保护符合最终格式的直接答案，原始辅助信息仍保存在 raw_text 中。"""
+    try:
+        parsed = repair_json_loads(text)
+        if not isinstance(parsed, dict) or parsed.get("direct_answer") is None:
+            return None
+        # direct_answer 是最终值，不使用模型额外的投影、精度等指令改写。
+        answer = normalize_answer(parsed["direct_answer"], question.answer_format, {})
+        if validate_answer_text(answer, question, allow_blank=False):
+            return None
+    except Exception:
+        return None
+    warnings: list[str] = []
+    try:
+        response = EvidenceResponse.model_validate(parsed)
+    except Exception:
+        response = EvidenceResponse(question_type=question.question_type)
+        warnings.append("辅助 Evidence/计划协议无效，仅保留原始日志；直接答案未被否决")
+    if not response.evidence:
+        warnings.append("直接答案缺少可解析 Evidence，仅记录，不触发重答")
+    return response.model_copy(update={
+        "status": "success", "direct_answer": parsed["direct_answer"], "output": {},
+    }), warnings
 
 
 def parse_evidence_response(text: str) -> EvidenceResponse:

@@ -6,11 +6,16 @@ from json_repair import loads as repair_json_loads
 
 from table_qa_agent.client import OpenAICompatibleVLClient
 from table_qa_agent.schemas import QuestionRecord, RegionRef, TaskPlan, TokenUsage
+from table_qa_agent.structure.contract import STRUCTURE_SCOPE_CONTRACT
 
 LOCATOR_PROMPT = """你是文档表格区域定位器。根据问题和页面缩略图，返回最可能包含
 目标字段、相关行头和列头的候选区域。bbox 使用 [x1,y1,x2,y2] 归一化坐标，范围 0 到 1。
 区域要保留足够行列上下文，不要只框数字。最多返回指定数量，只输出 JSON：
-{"regions":[{"page":1,"bbox":[0.0,0.0,1.0,1.0],"reason":"...","confidence":0.8}]}。
+{"regions":[{"page":1,"bbox":[0.0,0.0,1.0,1.0],"rotation_degrees":0,
+"reason":"...","confidence":0.8}]}。
+rotation_degrees 是将裁剪图转为文字正向所需的顺时针旋转角度，只允许 0/90/180/270；
+正常图填 0，侧置表格根据实际文字方向填写。bbox 始终使用旋转前原始页面的坐标。
+同页有多个不同表格时分别定位，不把它们拼成一个更宽的表格。
 """
 
 
@@ -41,8 +46,15 @@ class PageRegionLocator:
             f"首次失败：{failure_reason}\n"
             f"最多返回 {self.max_regions} 个区域。"
         )
+        scope_prompt = ""
+        if plan.specialist == "structure":
+            scope_prompt = "\n" + STRUCTURE_SCOPE_CONTRACT + (
+                "\n请定位输出范围及判断合并边界必需的邻接行列，不要只截一条文字。"
+                "第一列恢复需覆盖目标第一列的相关范围；表头恢复需包含所有表头层级。"
+                "后续专家还会看到原始全页，局部框只承担高清补充职责。"
+            )
         completion = self.client.complete(
-            system_prompt=LOCATOR_PROMPT,
+            system_prompt=LOCATOR_PROMPT + scope_prompt,
             user_text=user_text,
             image_content=image_content,
         )

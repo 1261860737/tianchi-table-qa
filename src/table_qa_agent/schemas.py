@@ -105,6 +105,7 @@ class RegionRef(BaseModel):
     """页内归一化候选区域，bbox 顺序为 x1,y1,x2,y2。"""
 
     page: int = Field(ge=1)
+    rotation_degrees: Literal[0, 90, 180, 270] = 0
     bbox: tuple[float, float, float, float]
     reason: str | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -134,9 +135,10 @@ class OCRResult(BaseModel):
 
 
 class RecoveryAttempt(BaseModel):
-    action: Literal["repair_operation", "locate_crop_ocr", "repair_structure"]
+    action: Literal["repair_operation", "locate_crop_ocr", "repair_structure", "patch_structure"]
     reason: str
     succeeded: bool = False
+    raw_output: str | None = None
 
 
 class QuestionRecord(BaseModel):
@@ -310,12 +312,26 @@ class TableStructureAnswer(BaseModel):
 
     @model_validator(mode="after")
     def validate_cells(self) -> TableStructureAnswer:
+        def describe(index: int) -> str:
+            cell = self.cells[index]
+            return (
+                f"cells[{index}] text={cell.text[:120]!r} "
+                f"rows=[{cell.row},{cell.row + cell.rowspan}) "
+                f"cols=[{cell.col},{cell.col + cell.colspan})"
+            )
+
         occupied: dict[tuple[int, int], int] = {}
         for index, cell in enumerate(self.cells):
             if cell.row + cell.rowspan > self.row_count:
-                raise ValueError(f"cells[{index}] 超出 row_count")
+                raise ValueError(
+                    f"{describe(index)} 超出 row_count={self.row_count}；"
+                    "检查完整表格尺寸或单元格行范围，不按裁剪图重新编号"
+                )
             if cell.col + cell.colspan > self.col_count:
-                raise ValueError(f"cells[{index}] 超出 col_count")
+                raise ValueError(
+                    f"{describe(index)} 超出 col_count={self.col_count}；"
+                    "检查完整表格尺寸或单元格列范围"
+                )
 
             for row in range(cell.row, cell.row + cell.rowspan):
                 for col in range(cell.col, cell.col + cell.colspan):
@@ -323,7 +339,9 @@ class TableStructureAnswer(BaseModel):
                     if coordinate in occupied:
                         previous = occupied[coordinate]
                         raise ValueError(
-                            f"cells[{index}] 与 cells[{previous}] 在 {coordinate} 重叠"
+                            f"{describe(index)} 与 {describe(previous)} 在 {coordinate} 重叠；"
+                            "坐标从 0 开始，范围为左闭右开；需核对位置、跨度或重复输出，"
+                            "不能仅为消除冲突而删除单元格"
                         )
                     occupied[coordinate] = index
         return self

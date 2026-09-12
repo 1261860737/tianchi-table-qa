@@ -11,8 +11,10 @@ from table_qa_agent.schemas import QuestionRecord, RegionRef, TokenUsage
 class FakeClient:
     def __init__(self, text: str) -> None:
         self.text = text
+        self.kwargs: dict[str, object] = {}
 
     def complete(self, **_: object) -> ModelCompletion:
+        self.kwargs = _
         return ModelCompletion(text=self.text, usage=TokenUsage(total_tokens=5))
 
 
@@ -57,3 +59,19 @@ def test_vision_ocr_returns_candidates_without_answering() -> None:
 
     assert result.as_prompt_text() == "营业收入 1,200"
     assert usage.total_tokens == 5
+
+
+def test_structure_locator_and_specialist_share_scope_contract() -> None:
+    from table_qa_agent.prompts import build_specialist_system_prompt
+    from table_qa_agent.structure.contract import STRUCTURE_SCOPE_CONTRACT
+
+    question = _question().model_copy(update={
+        "question_type": "structure", "answer_format": "json", "question": "恢复表头",
+    })
+    client = FakeClient('{"regions":[{"page":1,"bbox":[0,0,1,1]}]}')
+    PageRegionLocator(client).locate(
+        question, TaskPlanner().plan(question), [], failure_reason="补读",
+    )
+    assert STRUCTURE_SCOPE_CONTRACT in client.kwargs["system_prompt"]
+    assert STRUCTURE_SCOPE_CONTRACT in build_specialist_system_prompt("structure")
+    assert STRUCTURE_SCOPE_CONTRACT not in build_specialist_system_prompt("extract")
