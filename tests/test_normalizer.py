@@ -18,6 +18,20 @@ def test_string_percentage_respects_rounding_hint() -> None:
     assert normalize_answer(Decimal("12.345"), "string", {"decimals": 1, "suffix": "%"}) == "12.3%"
 
 
+@pytest.mark.parametrize("container", [["迭代与表达"], ("迭代与表达",)])
+def test_string_unwraps_singleton_sequence_at_scalar_boundary(container: object) -> None:
+    assert normalize_answer(container, "string") == "迭代与表达"
+
+
+@pytest.mark.parametrize("container", [[Decimal("25.0")], (Decimal("25.0"),)])
+def test_number_unwraps_singleton_sequence_at_scalar_boundary(container: object) -> None:
+    assert normalize_answer(container, "number") == "25"
+
+
+def test_string_keeps_multi_value_sequence_without_guessing() -> None:
+    assert normalize_answer(["TA6", "4.0~5.5"], "string") == '["TA6","4.0~5.5"]'
+
+
 def test_json_array_is_compact_and_keeps_chinese() -> None:
     assert normalize_answer([Decimal("1"), "华东"], "json_array") == '[1,"华东"]'
 
@@ -89,6 +103,6 @@ def test_answer_contract_rejects_none_and_explanatory_prefix() -> None:
     assert validate_answer_text("", question, allow_blank=False) == ["答案为空"]
 
 
-def test_number_rejects_list() -> None:
+def test_number_rejects_multi_value_list() -> None:
     with pytest.raises(AnswerNormalizationError):
-        normalize_answer([1], "number")
+        normalize_answer([1, 2], "number")

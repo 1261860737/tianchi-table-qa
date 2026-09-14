@@ -87,6 +87,21 @@ def _contains_null(value: Any) -> bool:
     return False
 
 
+def _unwrap_singleton_scalar(value: Any, answer_format: AnswerFormat) -> Any:
+    """收紧标量接口：仅解包无歧义的单元素序列。
+
+    模型或确定性 Operation 有时会把单个答案按 ``[value]`` 返回。题目已经用
+    ``answer_format`` 声明了标量语义，因此 string/number 下的一层单元素
+    list/tuple 只是接口形状噪声，可以在统一规范化边界安全消除。多元素序列
+    和对象仍交给各格式原有逻辑处理，避免猜测应保留哪个值。
+    """
+
+    if answer_format in {"string", "number"} and isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            return value[0]
+    return value
+
+
 EXPLANATORY_PREFIX = re.compile(
     r"^(?:根据(?:表格|图片|文档)|由(?:表格|图片|文档)|从(?:表格|图片|文档)|答案(?:是|为)|可知)"
 )
@@ -156,6 +171,7 @@ def normalize_answer(
 ) -> str:
     """标准化工具结果；所有提交答案最终都写成字符串。"""
 
+    value = _unwrap_singleton_scalar(value, answer_format)
     hints = output_hints or {}
     decimals_raw = hints.get("decimals")
     decimals = int(decimals_raw) if decimals_raw is not None else None
