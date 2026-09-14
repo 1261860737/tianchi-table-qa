@@ -12,6 +12,10 @@ from table_qa_agent.schemas import TableCell, TableStructureAnswer
 class StructureRepairError(ValueError):
     """结构无法通过确定性规则安全修复。"""
 
+    def __init__(self, message: str, *, candidate: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.candidate = candidate
+
 
 def repair_structure(value: Any) -> TableStructureAnswer:
     if isinstance(value, TableStructureAnswer):
@@ -45,11 +49,17 @@ def repair_structure(value: Any) -> TableStructureAnswer:
         max((cell.col + cell.colspan for cell in cells), default=0),
     )
 
+    candidate = {
+        "row_count": row_count,
+        "col_count": col_count,
+        "cells": [cell.model_dump() for cell in cells],
+    }
     try:
-        return TableStructureAnswer(row_count=row_count, col_count=col_count, cells=cells)
+        return TableStructureAnswer.model_validate(candidate)
     except ValidationError as exc:
         details = "; ".join(error["msg"] for error in exc.errors(include_input=False))
         raise StructureRepairError(
             "结构存在无法安全自动处理的重叠或几何冲突；"
-            f"以下索引对应去除完全重复项后的 cells：{details}"
+            f"以下索引对应去除完全重复项后的 cells：{details}",
+            candidate=candidate,
         ) from exc

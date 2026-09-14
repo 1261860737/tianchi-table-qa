@@ -176,13 +176,17 @@ class EvidenceItem(BaseModel):
     @field_validator("bbox", mode="before")
     @classmethod
     def clip_bbox_to_page(cls, value: Any) -> Any:
-        """裁剪模型轻微越界的 bbox；裁剪后无面积仍交给几何校验拒绝。"""
+        """规范化辅助 bbox；无法形成有效区域时按缺失处理，不否决证据值。"""
 
+        if value is None:
+            return None
         if not isinstance(value, (list, tuple)) or len(value) != 4:
-            return value
+            return None
         if not all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value):
-            return value
-        return tuple(min(1.0, max(0.0, float(item))) for item in value)
+            return None
+        clipped = tuple(min(1.0, max(0.0, float(item))) for item in value)
+        x1, y1, x2, y2 = clipped
+        return clipped if x1 < x2 and y1 < y2 else None
 
     @model_validator(mode="after")
     def validate_bbox(self) -> EvidenceItem:

@@ -118,7 +118,9 @@ def test_native_selection_works_in_pipeline() -> None:
 def test_prompts_share_one_answer_boundary(specialist: str, force: bool) -> None:
     prompt = build_specialist_system_prompt(specialist, force_answer=force)
     assert "必须绑定 Evidence" not in prompt
-    assert "multi_field 必须使用 Evidence + operation" in prompt
+    if specialist in {"extract", "visual_attribute"}:
+        assert "纯抽取可使用 direct_answer" in prompt or "纯视觉读取允许直接回答" in prompt
+        assert "multi_field 必须使用 Evidence + operation" not in prompt
     assert "不要使用 source 参数" not in prompt
     question = QuestionRecord(id=1, file_name="a.png", question_type="extract",
                               question="依次读取两个字段", answer_format="json_array")

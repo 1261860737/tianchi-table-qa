@@ -66,7 +66,7 @@ from table_qa_agent.schemas import (
 )
 from table_qa_agent.structure import StructureRepairError, repair_structure
 from table_qa_agent.structure.contract import structure_recovery_content
-from table_qa_agent.structure.patch import apply_structure_patch
+from table_qa_agent.structure.patch import apply_structure_patch_candidate
 from table_qa_agent.verification import assess_evidence
 
 # xlsx 中零长度文本常被读取器还原成 null/NaN。按 answer_format 写入合法的
@@ -440,34 +440,52 @@ class BaselinePipeline:
                     if (
                         not self.recovery.enabled or not self.recovery.max_structure_patches
                         or not structure_images or not callable(propose)
-                        or any(a.action == "patch_structure" for a in result.recovery_attempts)
                     ):
                         raise
-                    patch_attempt = RecoveryAttempt(action="patch_structure", reason=str(exc))
-                    result.recovery_attempts.append(patch_attempt)
-                    self._wait_for_request_slot()
-                    try:
-                        patch_images = structure_images
-                        if result.regions and result.document_path:
-                            paths = self.processor.prepare_regions(
-                                result.document_path, result.regions,
-                                roi_dpi=self.retrieval.roi_dpi,
-                                padding_ratio=self.retrieval.padding_ratio,
-                            )
-                            patch_images = structure_recovery_content(
-                                structure_images,
-                                self.processor.as_region_content(paths, result.regions),
-                            )
-                        completion = propose(question, tool_result, patch_images, exc)
-                        self._add_usage(result, completion.usage)
-                        patch_attempt.raw_output = completion.text
-                        tool_result = apply_structure_patch(
-                            tool_result, json.loads(completion.text),
+                    patch_images = structure_images
+                    if result.regions and result.document_path:
+                        paths = self.processor.prepare_regions(
+                            result.document_path, result.regions,
+                            roi_dpi=self.retrieval.roi_dpi,
+                            padding_ratio=self.retrieval.padding_ratio,
                         )
+                        patch_images = structure_recovery_content(
+                            structure_images,
+                            self.processor.as_region_content(paths, result.regions),
+                        )
+                    # 确定性去重和尺寸扩展即使未能消除重叠也仍然有效；后续补丁应在这个
+                    # 规范化候选上继续，不能退回原始错误尺寸。
+                    candidate = exc.candidate or tool_result
+                    current_error: Exception = exc
+                    resolved = False
+                    for _ in range(self.recovery.max_structure_patches):
+                        patch_attempt = RecoveryAttempt(
+                            action="patch_structure", reason=str(current_error),
+                        )
+                        result.recovery_attempts.append(patch_attempt)
+                        self._wait_for_request_slot()
+                        try:
+                            completion = propose(
+                                question, candidate, patch_images, current_error,
+                            )
+                            self._add_usage(result, completion.usage)
+                            patch_attempt.raw_output = completion.text
+                            candidate = apply_structure_patch_candidate(
+                                candidate, json.loads(completion.text),
+                            )
+                            tool_result = TableStructureAnswer.model_validate(candidate)
+                        except Exception as patch_error:
+                            current_error = patch_error
+                            patch_attempt.reason += f"；本轮候选仍不合法：{patch_error}"
+                            continue
                         patch_attempt.succeeded = True
-                    except Exception as patch_error:
-                        patch_attempt.reason += f"；受限修复失败：{patch_error}"
-                        raise StructureRepairError(patch_attempt.reason) from patch_error
+                        resolved = True
+                        break
+                    if not resolved:
+                        raise StructureRepairError(
+                            "受限结构修复达到次数上限，候选仍未通过完整几何校验："
+                            f"{current_error}"
+                        ) from current_error
 
         result.tool_result = tool_result
         if operation_selects_answer(operation):

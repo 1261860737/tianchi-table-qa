@@ -27,7 +27,7 @@ from table_qa_agent.schemas import (
     TokenUsage,
 )
 from table_qa_agent.structure.contract import STRUCTURE_SCOPE_CONTRACT
-from table_qa_agent.structure.patch import conflict_indices
+from table_qa_agent.structure.patch import conflict_details, conflict_indices
 
 
 class EvidenceValidationError(ValueError):
@@ -240,13 +240,17 @@ class EvidenceAgent:
         return self.client.complete(
             system_prompt=STRUCTURE_SCOPE_CONTRACT + "\n"
             "你是结构几何修复器。对照图片，只修正 allowed_indices 中单元格的位置或跨度。"
+            "conflicts 已列出当前候选的全部几何冲突；一次 updates 可修改多个冲突单元格，"
+            "应尽量同时解决全部列出的冲突。"
             "父级表头有子级并不表示父级占据子级所在行；以实际可见边界为准。"
             "禁止修改文本、其他单元格和整表尺寸，禁止删格或新增格。"
             '只返回 JSON：{"updates":[{"index":0,"row":0,"col":0,"rowspan":1,"colspan":1}]}。'
             '无法在此边界内确定修复时返回 {"updates":[]}，不要强行猜测。',
             user_text=json.dumps({
                 "question": question.question, "candidate": value,
-                "allowed_indices": conflict_indices(value), "error": str(error),
+                "allowed_indices": conflict_indices(value),
+                "conflicts": conflict_details(value),
+                "error": str(error),
             }, ensure_ascii=False),
             image_content=image_content,
         )
@@ -319,6 +323,16 @@ def parse_direct_response(
     except Exception:
         response = EvidenceResponse(question_type=question.question_type)
         warnings.append("辅助 Evidence/计划协议无效，仅保留原始日志；直接答案未被否决")
+    else:
+        raw_evidence = parsed.get("evidence")
+        if isinstance(raw_evidence, list) and any(
+            isinstance(raw_item, dict)
+            and raw_item.get("bbox") is not None
+            and index < len(response.evidence)
+            and response.evidence[index].bbox is None
+            for index, raw_item in enumerate(raw_evidence)
+        ):
+            warnings.append("无效辅助 Evidence bbox 已按缺失处理；直接答案未被否决")
     if not response.evidence:
         warnings.append("直接答案缺少可解析 Evidence，仅记录，不触发重答")
     return response.model_copy(update={

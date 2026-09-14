@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from table_qa_agent.agent import EvidenceAgent, EvidenceValidationError
@@ -105,6 +107,29 @@ def test_agent_tolerates_unicode_evidence_id_and_slight_bbox_overflow() -> None:
     assert output.evidence.evidence[0].bbox == (0.82, 0.96, 0.98, 1.0)
 
 
+@pytest.mark.parametrize("bbox", [
+    [0, 0, 0, 0],
+    [0.4, 0.2, 0.1, 0.8],
+    ["bad", 0, 1, 1],
+    [0, 1, 1],
+])
+def test_agent_treats_invalid_evidence_bbox_as_missing(bbox: list[object]) -> None:
+    raw = json.dumps({
+        "status": "success",
+        "question_type": "extract",
+        "evidence": [{"value_raw": "120", "value": 120, "bbox": bbox}],
+        "operation": {"name": "lookup", "arguments": {
+            "value": {"evidence_index": 0},
+        }},
+        "output": {"type": "number"},
+    })
+
+    output = EvidenceAgent(FakeClient(raw)).run(_question(), [])  # type: ignore[arg-type]
+
+    assert output.evidence.evidence[0].value == 120
+    assert output.evidence.evidence[0].bbox is None
+
+
 def test_agent_treats_operation_with_steps_as_pipeline() -> None:
     raw = """{
       "status": "success",
@@ -138,6 +163,7 @@ def test_force_answer_prompt_disallows_refusal_and_keeps_format_contract() -> No
     assert "优先调用工具" in prompt
     assert "必须返回 status=success" in prompt
     assert "最终值必须非空，且严格满足题目的 answer_format" in prompt
+    assert "启用 format-only 时不得走拒答" in system_prompt
     assert "format-only 答案策略（优先于上面的证据不足与拒答规则）" in system_prompt
     assert "Evidence 可选且不作为拒答条件" in system_prompt
 

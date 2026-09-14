@@ -92,7 +92,7 @@ class RecoveryConfig(BaseModel):
     max_visual_retries: int = Field(default=1, ge=0, le=1)
     max_agent_tool_calls: int = Field(default=1, ge=0, le=3)
     repair_structure_dimensions: bool = True
-    max_structure_patches: int = Field(default=1, ge=0, le=1)
+    max_structure_patches: int = Field(default=2, ge=0, le=3)
 
 
 class AppConfig(BaseModel):

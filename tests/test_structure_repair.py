@@ -15,17 +15,19 @@ def test_structure_repair_infers_minimum_dimensions_and_deduplicates() -> None:
 
 
 def test_structure_repair_does_not_guess_overlapping_semantics() -> None:
-    with pytest.raises(StructureRepairError, match="无法安全"):
+    with pytest.raises(StructureRepairError, match="无法安全") as caught:
         repair_structure(
             {
                 "row_count": 2,
-                "col_count": 2,
+                "col_count": 1,
                 "cells": [
                     {"text": "金额", "row": 0, "col": 0, "rowspan": 1, "colspan": 2},
                     {"text": "2025", "row": 0, "col": 1, "rowspan": 1, "colspan": 1},
                 ],
             }
         )
+    assert caught.value.candidate is not None
+    assert caught.value.candidate["col_count"] == 2
 
 
 def test_overlap_reports_both_cells_and_preserves_input() -> None:

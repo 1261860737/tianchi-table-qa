@@ -2,7 +2,11 @@ from copy import deepcopy
 
 import pytest
 
-from table_qa_agent.structure.patch import apply_structure_patch, conflict_indices
+from table_qa_agent.structure.patch import (
+    apply_structure_patch,
+    conflict_details,
+    conflict_indices,
+)
 
 
 @pytest.fixture
@@ -23,6 +27,20 @@ def test_geometry_patch_preserves_text_other_cells_and_source(candidate: dict) -
     assert candidate == original
     assert output["cells"][1:] == original["cells"][1:]
     assert output["cells"][0]["text"] == "父级"
+
+
+def test_conflict_details_reports_every_overlap() -> None:
+    value = {"row_count": 2, "col_count": 4, "cells": [
+        {"text": "父级A", "row": 0, "col": 0, "rowspan": 2, "colspan": 2},
+        {"text": "子级A", "row": 1, "col": 0, "rowspan": 1, "colspan": 1},
+        {"text": "父级B", "row": 0, "col": 2, "rowspan": 2, "colspan": 2},
+        {"text": "子级B", "row": 1, "col": 2, "rowspan": 1, "colspan": 1},
+    ]}
+
+    details = conflict_details(value)
+
+    assert [detail["indices"] for detail in details] == [[0, 1], [2, 3]]
+    assert conflict_indices(value) == [0, 1, 2, 3]
 
 
 @pytest.mark.parametrize("change", [
@@ -97,3 +115,69 @@ def test_pipeline_applies_patch_and_records_proposal(tmp_path, candidate: dict) 
     assert result.recovery_attempts[-1].raw_output
     assert json.loads(result.final_answer)["cells"][0]["rowspan"] == 1
     assert candidate["cells"][0]["rowspan"] == 2
+
+
+def test_pipeline_can_resolve_multiple_conflicts_in_bounded_patch_rounds(tmp_path) -> None:
+    import json
+
+    from table_qa_agent.agent import AgentOutput
+    from table_qa_agent.client import ModelCompletion
+    from table_qa_agent.config import DocumentConfig, RecoveryConfig, RuntimeConfig
+    from table_qa_agent.dataset import DocumentResolver
+    from table_qa_agent.documents import DocumentProcessor
+    from table_qa_agent.pipeline import BaselinePipeline
+    from table_qa_agent.schemas import (
+        EvidenceItem,
+        EvidenceResponse,
+        OperationSpec,
+        QuestionRecord,
+        RunResult,
+        TaskPlan,
+        TokenUsage,
+    )
+
+    candidate = {"row_count": 2, "col_count": 4, "cells": [
+        {"text": "父级A", "row": 0, "col": 0, "rowspan": 2, "colspan": 2},
+        {"text": "子级A", "row": 1, "col": 0, "rowspan": 1, "colspan": 1},
+        {"text": "父级B", "row": 0, "col": 2, "rowspan": 2, "colspan": 2},
+        {"text": "子级B", "row": 1, "col": 2, "rowspan": 1, "colspan": 1},
+    ]}
+
+    class Agent:
+        calls = 0
+
+        def propose_structure_patch(self, question, value, images, error):
+            index = 0 if self.calls == 0 else 2
+            self.calls += 1
+            return ModelCompletion(text=json.dumps({"updates": [{
+                "index": index, "row": 0, "col": index,
+                "rowspan": 1, "colspan": 2,
+            }]}), usage=TokenUsage(total_tokens=7))
+
+    agent = Agent()
+    pipeline = BaselinePipeline(
+        resolver=DocumentResolver(tmp_path), agent=agent,
+        processor=DocumentProcessor(DocumentConfig(cache_dir=tmp_path / "cache")),
+        runtime=RuntimeConfig(log_dir=tmp_path / "logs"),
+        recovery=RecoveryConfig(max_structure_patches=2),
+    )
+    question = QuestionRecord(
+        id=1, file_name="table.png", question_type="structure",
+        question="恢复表头", answer_format="json",
+    )
+    result = RunResult(question_id=1, question=question.question, document_id="table.png")
+    pipeline._execute_agent_output(
+        result=result, question=question,
+        plan=TaskPlan(task_kind="structure_recover", specialist="structure"), agent=agent,
+        structure_images=[{"type": "text", "text": "测试上下文"}],
+        agent_output=AgentOutput(evidence=EvidenceResponse(
+            question_type="structure", evidence=[EvidenceItem(value=candidate)],
+            operation=OperationSpec(name="lookup", arguments={"value": {
+                "evidence_index": 0,
+            }}),
+        ), raw_text="{}", usage=TokenUsage()),
+    )
+
+    assert agent.calls == 2
+    assert [attempt.succeeded for attempt in result.recovery_attempts[-2:]] == [False, True]
+    assert json.loads(result.final_answer)["cells"][2]["rowspan"] == 1
